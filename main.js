@@ -1,0 +1,1655 @@
+'use strict';
+
+/* ================================================================
+   SLAP SIMULATOR — main.js
+   3-D browser game: upload a face → detect it → slap the ragdoll
+   → watch it fly with Cannon.js physics
+
+   Structure
+   ---------
+   1.  Constants & state
+   2.  Three.js renderer / scene / lights / room
+   3.  Cannon.js physics world
+   4.  Ragdoll (static display + physics activation on slap)
+   5.  face-api.js face detection & texture creation
+   6.  Slap input (mouse + touch)
+   7.  Score system
+   8.  UI helpers
+   9.  Animation loop
+   10. Bootstrap
+   ================================================================ */
+
+
+// ================================================================
+// 1.  CONSTANTS & GLOBAL STATE
+// ================================================================
+
+/**
+ * Primary URL prefix for face-api.js model weights.
+ * We serve them from the repo's own `models/` folder so the game works
+ * without any external network request (fixes "Failed to fetch" errors).
+ */
+const MODELS_URL = './models';
+
+/** CDN fallback URL used when the local models/ folder is unreachable. */
+const MODELS_URL_CDN = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights';
+
+/** Physics gravity (m/s² — exaggerated for fun but kept mild so the character stays airborne longer). */
+const GRAVITY = -14;
+
+/** Room half-size in metres — large enough for epic long-distance launches. */
+const ROOM_HALF = 70;
+
+/** Maximum impulse force that can be applied by one slap. */
+const MAX_FORCE = 520;
+
+/**
+ * Tiny baseline force so that even a barely-qualifying swipe still does
+ * something visible.  Kept low so swipe speed is the dominant factor.
+ */
+const BASE_FORCE = 5;
+
+/**
+ * How many Newtons per px/s of swipe speed.
+ * With this value a ~2 340 px/s swipe reaches MAX_FORCE.
+ * A slow 200 px/s swipe produces only ~49 N — a feeble push.
+ */
+const FORCE_SPEED_MULTIPLIER = 0.22;
+
+/** Fraction of head-bounding-box used as padding when cropping the face. */
+const FACE_CROP_PADDING_RATIO = 0.38;
+
+/** Maximum image file size (bytes) accepted before processing begins. */
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+
+/**
+ * File-name extensions accepted when the browser reports no MIME type
+ * (common with HEIC / HEIF / AVIF on some platforms).
+ */
+const ACCEPTED_IMAGE_EXTS = new Set([
+  'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp',
+  'tif', 'tiff', 'heic', 'heif', 'avif', 'jfif',
+]);
+
+/**
+ * TinyFaceDetector input sizes tried in order (smallest → largest).
+ * Retrying with a larger input size catches faces that the small pass misses.
+ */
+const FACE_DETECT_INPUT_SIZES = [160, 224, 320, 416];
+
+/** How long to pause (ms) after landing before the return animation starts. */
+const RETURN_PAUSE_MS = 300;
+
+/** Detection margin (m) around each building AABB for collision triggering.
+ *  Large enough that crumble fires before the character physically hits the wall
+ *  even at maximum launch speed. */
+const BUILDING_COLLISION_MARGIN = 2.8;
+
+/** Duration (ms) of the fast get-up phase (gather into crouch → rise to stand). */
+const GETUP_DURATION_MS = 650;
+
+/** Fraction of GETUP_DURATION_MS spent gathering the ragdoll parts into a crouch. */
+const GATHER_FRAC = 0.45;
+
+/** Duration (ms) of the walk-back phase once the character is standing. */
+const WALK_DURATION_MS = 950;
+
+/** Number of full step cycles during the walk-back phase. */
+const WALK_STEP_CYCLES = 2.5;
+const LANDING_HEIGHT_THRESHOLD = 0.6;
+
+/** Speed (m/s) below which a landed character is considered at rest. */
+const LANDING_SPEED_THRESHOLD = 0.8;
+
+/**
+ * Combo messages, shown after the character lands.
+ * Each entry requires the character to have flown at least `min` metres.
+ */
+const COMBOS = [
+  { min: 0,   text: 'LIGHT TAP 😴',             color: '#aaaaaa' },
+  { min: 3,   text: 'NICE SLAP! 👋',            color: '#ffde00' },
+  { min: 10,  text: 'SUPER COMBO! 🔥',          color: '#ff8c00' },
+  { min: 22,  text: 'CRITICAL SLAP! 💥',        color: '#ff4444' },
+  { min: 40,  text: 'EMOTIONAL DAMAGE! 😭💢',   color: '#ff00ff' },
+  { min: 65,  text: 'CITY DESTROYER! 🏙️💥',     color: '#00ffff' },
+];
+
+/** Finite-state machine states for the game. */
+const STATE = {
+  INTRO:     'intro',      // start screen visible
+  LOADING:   'loading',    // face detection / model load in progress
+  READY:     'ready',      // character on screen, waiting for slap
+  FLYING:    'flying',     // character was slapped and is in the air / tumbling
+  RETURNING: 'returning',  // character is animating back to standing pose
+};
+let gameState = STATE.INTRO;
+
+// ---- Three.js globals ----------------------------------------
+let scene, camera, renderer;
+
+// ---- Cannon.js globals ---------------------------------------
+let physicsWorld;
+const FIXED_DT  = 1 / 60;   // physics step size
+const MAX_STEPS = 3;         // max sub-steps per frame
+let lastTimestamp = null;
+
+// ---- Ragdoll -------------------------------------------------
+/**
+ * Active character object.
+ * {
+ *   parts:       Array<{ mesh: THREE.Mesh, body: CANNON.Body, mass: number }>
+ *   neckMesh:    THREE.Mesh    (visual only — not a physics body)
+ *   constraints: Array<CANNON.Constraint>
+ *   headBody:    CANNON.Body
+ *   torsoBody:   CANNON.Body
+ *   isPhysicsOn: boolean
+ * }
+ */
+let character = null;
+
+/** Three.js texture from the uploaded face image. */
+let faceTexture = null;
+
+// ---- Slap input ----------------------------------------------
+let pointerIsDown  = false;
+let swipeStart     = null;   // { x, y, time }
+
+// ---- Score ---------------------------------------------------
+let slapOrigin = new THREE.Vector3(); // world pos of head when slapped
+let maxFlyDist = 0;                   // maximum horizontal distance reached
+
+// ---- Return animation ----------------------------------------
+/** Tracks an in-progress "get back up and return" animation. */
+let returnAnimation = null;
+
+// ---- Buildings -----------------------------------------------
+/** Array of destructible building objects created by initBuildings(). */
+let buildings = [];
+
+// ---- Camera follow -------------------------------------------
+/** Default camera world position and look-at target. */
+const CAM_DEFAULT_POS  = new THREE.Vector3(0, 1.6, 4.0);
+const CAM_DEFAULT_LOOK = new THREE.Vector3(0, 1.1, 0);
+
+
+// ================================================================
+// 2.  THREE.JS — RENDERER, SCENE, LIGHTS, ROOM
+// ================================================================
+
+/** Set up the Three.js renderer and resize listener. */
+function initRenderer() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d0d1a);
+  scene.fog = new THREE.FogExp2(0x0d0d1a, 0.005);
+
+  // Perspective camera positioned in front of the character
+  camera = new THREE.PerspectiveCamera(
+    65,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    320
+  );
+  camera.position.set(0, 1.6, 4.0);
+  camera.lookAt(0, 1.1, 0);
+
+  const canvas = document.getElementById('game-canvas');
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+/** Add ambient, directional (shadow-casting), and accent lights. */
+function initLights() {
+  // Soft ambient fill
+  scene.add(new THREE.AmbientLight(0xffffff, 0.38));
+
+  // Main directional light with shadows
+  const sun = new THREE.DirectionalLight(0xfff5e0, 1.1);
+  sun.position.set(4, 10, 6);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.camera.near   = 0.5;
+  sun.shadow.camera.far    = 35;
+  sun.shadow.camera.top    = 10;
+  sun.shadow.camera.bottom = -2;
+  sun.shadow.camera.left   = -10;
+  sun.shadow.camera.right  =  10;
+  scene.add(sun);
+
+  // Cool purple rim light from behind
+  const rim = new THREE.DirectionalLight(0x7733ff, 0.5);
+  rim.position.set(-4, 4, -6);
+  scene.add(rim);
+
+  // Warm point light near camera
+  const fill = new THREE.PointLight(0xff4400, 0.65, 14);
+  fill.position.set(0, 3, 3.5);
+  scene.add(fill);
+
+  // Blue city-glow lights near the distant buildings
+  const cityGlow1 = new THREE.PointLight(0x2255cc, 0.7, 40);
+  cityGlow1.position.set(0, 6, -18);
+  scene.add(cityGlow1);
+
+  const cityGlow2 = new THREE.PointLight(0x112244, 0.5, 60);
+  cityGlow2.position.set(0, 10, -40);
+  scene.add(cityGlow2);
+}
+
+/** Build the room: floor, grid overlay, and box-shaped walls/ceiling. */
+function initRoom() {
+  // Floor plane
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x1c1c2e, roughness: 0.95 });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_HALF * 2, ROOM_HALF * 2), floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  // Subtle grid for depth cue (70 divisions → 2 m cells at the new room scale)
+  const grid = new THREE.GridHelper(ROOM_HALF * 2, 70, 0x333355, 0x222244);
+  grid.position.y = 0.003;
+  scene.add(grid);
+
+  // Room walls and ceiling rendered as the inside of a large box
+  const wallMat = new THREE.MeshStandardMaterial({
+    color:     0x16162a,
+    roughness: 1.0,
+    side:      THREE.BackSide,
+  });
+  const room = new THREE.Mesh(
+    new THREE.BoxGeometry(ROOM_HALF * 2, 12, ROOM_HALF * 2),
+    wallMat
+  );
+  room.position.set(0, 6, 0);
+  room.receiveShadow = true;
+  scene.add(room);
+
+  // Distant skyline silhouettes — purely decorative background objects,
+  // no physics bodies, placed just inside the far wall.
+  const skylineZ   = -ROOM_HALF + 4;
+  const skylineMat = new THREE.MeshStandardMaterial({ color: 0x0a0f1c, roughness: 1 });
+  [
+    { x: -28, w: 10, h: 32 }, { x: -16, w: 15, h: 42 },
+    { x:   2, w:  8, h: 26 }, { x:  12, w: 12, h: 36 },
+    { x:  25, w:  9, h: 29 },
+  ].forEach(s => {
+    const m = new THREE.Mesh(
+      new THREE.BoxGeometry(s.w, s.h, 4),
+      skylineMat
+    );
+    m.position.set(s.x, s.h / 2, skylineZ);
+    m.receiveShadow = true;
+    scene.add(m);
+  });
+}
+
+
+// ================================================================
+// 3.  CANNON.JS — PHYSICS WORLD
+// ================================================================
+
+/** Create the physics world with gravity, broadphase, and boundary planes. */
+function initPhysics() {
+  physicsWorld = new CANNON.World();
+  physicsWorld.gravity.set(0, GRAVITY, 0);
+  physicsWorld.broadphase = new CANNON.NaiveBroadphase();
+  physicsWorld.solver.iterations = 18;
+  physicsWorld.allowSleep = true;
+
+  // Floor (horizontal plane, normal pointing up)
+  const floorBody = new CANNON.Body({ mass: 0 });
+  floorBody.addShape(new CANNON.Plane());
+  floorBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+  physicsWorld.addBody(floorBody);
+
+  // Back wall (stops the character flying through the back wall)
+  // CANNON.Plane default normal = +Z; placed at z = -ROOM_HALF it blocks -Z travel.
+  const backWall = new CANNON.Body({ mass: 0 });
+  backWall.addShape(new CANNON.Plane());
+  backWall.position.set(0, 0, -ROOM_HALF);
+  physicsWorld.addBody(backWall);
+
+  // Left wall — rotate so normal points +X (blocks objects going below x = -ROOM_HALF)
+  const leftWall = new CANNON.Body({ mass: 0 });
+  leftWall.addShape(new CANNON.Plane());
+  leftWall.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), Math.PI / 2);
+  leftWall.position.set(-ROOM_HALF, 0, 0);
+  physicsWorld.addBody(leftWall);
+
+  // Right wall — rotate so normal points -X
+  const rightWall = new CANNON.Body({ mass: 0 });
+  rightWall.addShape(new CANNON.Plane());
+  rightWall.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), -Math.PI / 2);
+  rightWall.position.set(ROOM_HALF, 0, 0);
+  physicsWorld.addBody(rightWall);
+}
+
+
+// ================================================================
+// 4.  RAGDOLL
+// ================================================================
+
+/**
+ * Anatomy measurements (all in metres).
+ * These define every part's standing-pose centre position AND are
+ * used to derive constraint pivot offsets so joints are already
+ * satisfied when the character is first created.
+ *
+ * Layout (y = 0 is the floor):
+ *   Head centre          y = 1.58
+ *   Neck joint           y = 1.40
+ *   Torso centre         y = 1.025
+ *   Hip joint            y = 0.75
+ *   Thigh centre         y = 0.55
+ *   Knee joint           y = 0.35
+ *   Shin centre          y = 0.175   (shin bottom = floor at y = 0)
+ *   Shoulder joint       y = 1.25,   x = ±0.28
+ *   Upper-arm centre     y = 1.11,   x = ±0.28
+ *   Elbow joint          y = 0.97,   x = ±0.28
+ *   Forearm centre       y = 0.85,   x = ±0.28
+ */
+const ANAT = {
+  // Starting X position of the character (world)
+  cx: 0,
+  cz: -0.5,
+
+  head:      { r: 0.18 },
+  torso:     { hw: 0.21, hh: 0.275, hd: 0.11 },  // half-extents
+  upperArm:  { hw: 0.06, hh: 0.14,  hd: 0.06 },
+  foreArm:   { hw: 0.05, hh: 0.12,  hd: 0.05 },
+  thigh:     { hw: 0.07, hh: 0.20,  hd: 0.07 },
+  shin:      { hw: 0.055, hh: 0.175, hd: 0.055 },
+};
+
+/**
+ * Create a complete standing-pose character.
+ *
+ * All Cannon bodies start as STATIC (mass = 0) so the figure holds
+ * its pose without physics.  When the player slaps, `activateRagdoll()`
+ * switches every body to DYNAMIC and creates the joint constraints.
+ *
+ * @param {THREE.Texture|null} faceTex - Cropped face texture for the head.
+ * @returns {object} Character descriptor consumed by the rest of the game.
+ */
+function createCharacter(faceTex) {
+  const parts = [];
+  const { cx, cz } = ANAT;
+
+  // ---- Helper: create one body+mesh pair -----------------------
+  function makePart(name, geo, mat, pos, mass, cannonShape) {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+
+    // Use explicit Cannon shape if provided; otherwise derive from geometry type.
+    let shape;
+    if (cannonShape) {
+      shape = cannonShape;
+    } else if (geo.type === 'SphereGeometry' || geo.type === 'SphereBufferGeometry') {
+      shape = new CANNON.Sphere(ANAT.head.r);
+    } else if (geo.type === 'BoxGeometry' || geo.type === 'BoxBufferGeometry') {
+      const p = geo.parameters;
+      shape = new CANNON.Box(
+        new CANNON.Vec3(p.width / 2, p.height / 2, p.depth / 2)
+      );
+    } else {
+      throw new Error('[SlapSim] makePart: unsupported geometry type "' + geo.type + '"');
+    }
+
+    const body = new CANNON.Body({ mass: 0, linearDamping: 0.04, angularDamping: 0.08 });
+    body.addShape(shape);
+    body.position.set(pos.x, pos.y, pos.z);
+    body.type = CANNON.Body.STATIC;
+    body.allowSleep = true;
+    physicsWorld.addBody(body);
+
+    parts.push({ name, mesh, body, mass });
+    return { mesh, body };
+  }
+
+  // ---- Materials -----------------------------------------------
+  const skinMat  = new THREE.MeshStandardMaterial({ color: 0xf5c5a3, roughness: 0.70, metalness: 0.0 });
+  const shirtMat = new THREE.MeshStandardMaterial({ color: 0xdd2277, roughness: 0.55, metalness: 0.0 }); // rose-pink top
+  const pantsMat = skinMat;                                                                               // same skin tone (bare legs)
+  const shoeMat  = new THREE.MeshStandardMaterial({ color: 0x880011, roughness: 0.55, metalness: 0.1 }); // red shoes
+
+  const a = ANAT;
+
+  // ---- HEAD ---------------------------------------------------
+  // The head sphere uses plain skin colour; the uploaded face is
+  // rendered as a flat decal plane attached to the front of the sphere
+  // so it always looks like a naturally-placed portrait.
+  const { mesh: headMesh, body: headBody } = makePart(
+    'head',
+    new THREE.SphereGeometry(a.head.r, 18, 18),
+    skinMat,
+    { x: cx, y: 1.58, z: cz },
+    4
+  );
+
+  // Face decal — a small plane sitting just in front of the sphere
+  let faceDecalMesh = null;
+  if (faceTex) {
+    // Scale to roughly fill the visible face area of the sphere (≈ 1.85 × radius)
+    const decalSize = a.head.r * 1.85;
+    faceDecalMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(decalSize, decalSize),
+      new THREE.MeshStandardMaterial({
+        map: faceTex,
+        roughness: 0.65,
+        transparent: true,
+        alphaTest: 0.01,
+        depthWrite: false,
+      })
+    );
+    // Place the decal at the front (+Z = toward camera) of the sphere.
+    // 0.98 × radius sits just inside the surface to avoid z-fighting;
+    // the +0.001 m micro-offset gives an extra safety margin.
+    // The +0.015 m y-offset nudges the face slightly upward so the
+    // forehead is not clipped by the top of the sphere.
+    faceDecalMesh.position.set(0, 0.015, a.head.r * 0.98 + 0.001);
+    headMesh.add(faceDecalMesh);
+  }
+
+  // Hair — dark partial hemisphere sitting on top of the head sphere.
+  // It's a child of headMesh so it tumbles with the ragdoll head.
+  const hairMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(a.head.r * 1.05, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55),
+    new THREE.MeshStandardMaterial({ color: 0x1a0a00, roughness: 0.92 })
+  );
+  hairMesh.position.set(0, a.head.r * 0.12, 0);
+  hairMesh.castShadow = true;
+  headMesh.add(hairMesh);
+
+  // ---- TORSO --------------------------------------------------
+  const { mesh: torsoMesh, body: torsoBody } = makePart(
+    'torso',
+    new THREE.BoxGeometry(a.torso.hw * 2, a.torso.hh * 2, a.torso.hd * 2),
+    shirtMat,
+    { x: cx, y: 1.025, z: cz },
+    10
+  );
+
+  // Decorative skirt — frustum cylinder attached to the torso so it
+  // tumbles with the body during ragdoll physics.
+  const skirtMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.19, 0.27, 0.38, 14),
+    new THREE.MeshStandardMaterial({ color: 0xcc44cc, roughness: 0.7 })
+  );
+  skirtMesh.position.set(0, -0.465, 0); // relative to torso centre
+  skirtMesh.castShadow = true;
+  torsoMesh.add(skirtMesh);
+
+  // ---- LEFT UPPER ARM -----------------------------------------
+  // CylinderGeometry for rounded visual; CANNON.Box keeps physics joints intact.
+  const { body: luaBody } = makePart(
+    'leftUpperArm',
+    new THREE.CylinderGeometry(a.upperArm.hd * 0.95, a.upperArm.hd * 0.85, a.upperArm.hh * 2, 10),
+    shirtMat,
+    { x: cx - 0.28, y: 1.11, z: cz },
+    2,
+    new CANNON.Box(new CANNON.Vec3(a.upperArm.hw, a.upperArm.hh, a.upperArm.hd))
+  );
+
+  // ---- RIGHT UPPER ARM ----------------------------------------
+  const { body: ruaBody } = makePart(
+    'rightUpperArm',
+    new THREE.CylinderGeometry(a.upperArm.hd * 0.95, a.upperArm.hd * 0.85, a.upperArm.hh * 2, 10),
+    shirtMat,
+    { x: cx + 0.28, y: 1.11, z: cz },
+    2,
+    new CANNON.Box(new CANNON.Vec3(a.upperArm.hw, a.upperArm.hh, a.upperArm.hd))
+  );
+
+  // ---- LEFT FOREARM -------------------------------------------
+  const { body: lfaBody } = makePart(
+    'leftForeArm',
+    new THREE.CylinderGeometry(a.foreArm.hd * 0.90, a.foreArm.hd * 0.80, a.foreArm.hh * 2, 10),
+    skinMat,
+    { x: cx - 0.28, y: 0.85, z: cz },
+    1.5,
+    new CANNON.Box(new CANNON.Vec3(a.foreArm.hw, a.foreArm.hh, a.foreArm.hd))
+  );
+
+  // ---- RIGHT FOREARM ------------------------------------------
+  const { body: rfaBody } = makePart(
+    'rightForeArm',
+    new THREE.CylinderGeometry(a.foreArm.hd * 0.90, a.foreArm.hd * 0.80, a.foreArm.hh * 2, 10),
+    skinMat,
+    { x: cx + 0.28, y: 0.85, z: cz },
+    1.5,
+    new CANNON.Box(new CANNON.Vec3(a.foreArm.hw, a.foreArm.hh, a.foreArm.hd))
+  );
+
+  // ---- LEFT THIGH ---------------------------------------------
+  const { body: lthBody } = makePart(
+    'leftThigh',
+    new THREE.CylinderGeometry(a.thigh.hd * 1.05, a.thigh.hd * 0.92, a.thigh.hh * 2, 10),
+    pantsMat,
+    { x: cx - 0.12, y: 0.55, z: cz },
+    4,
+    new CANNON.Box(new CANNON.Vec3(a.thigh.hw, a.thigh.hh, a.thigh.hd))
+  );
+
+  // ---- RIGHT THIGH --------------------------------------------
+  const { body: rthBody } = makePart(
+    'rightThigh',
+    new THREE.CylinderGeometry(a.thigh.hd * 1.05, a.thigh.hd * 0.92, a.thigh.hh * 2, 10),
+    pantsMat,
+    { x: cx + 0.12, y: 0.55, z: cz },
+    4,
+    new CANNON.Box(new CANNON.Vec3(a.thigh.hw, a.thigh.hh, a.thigh.hd))
+  );
+
+  // ---- LEFT SHIN ----------------------------------------------
+  const { body: lshBody } = makePart(
+    'leftShin',
+    new THREE.CylinderGeometry(a.shin.hd * 0.90, a.shin.hd * 0.80, a.shin.hh * 2, 10),
+    shoeMat,
+    { x: cx - 0.12, y: 0.175, z: cz },
+    3,
+    new CANNON.Box(new CANNON.Vec3(a.shin.hw, a.shin.hh, a.shin.hd))
+  );
+
+  // ---- RIGHT SHIN ---------------------------------------------
+  const { body: rshBody } = makePart(
+    'rightShin',
+    new THREE.CylinderGeometry(a.shin.hd * 0.90, a.shin.hd * 0.80, a.shin.hh * 2, 10),
+    shoeMat,
+    { x: cx + 0.12, y: 0.175, z: cz },
+    3,
+    new CANNON.Box(new CANNON.Vec3(a.shin.hw, a.shin.hh, a.shin.hd))
+  );
+
+  // ---- NECK (visual connector mesh, no physics body) ----------
+  const neckMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.055, 0.065, 0.18, 8),
+    skinMat
+  );
+  neckMesh.castShadow = true;
+  scene.add(neckMesh);
+
+  return {
+    parts,
+    neckMesh,
+    faceDecalMesh,
+    skirtMesh,
+    constraints: [],
+    headBody,
+    torsoBody,
+    luaBody, ruaBody,
+    lfaBody, rfaBody,
+    lthBody, rthBody,
+    lshBody, rshBody,
+    isPhysicsOn: false,
+  };
+}
+
+/**
+ * Switch all ragdoll bodies from STATIC → DYNAMIC and wire up
+ * point-to-point joint constraints.  Called once, when the player
+ * lands their first slap.
+ *
+ * Constraint pivot maths:
+ *   worldPivot = bodyCenter + localOffset
+ * Both sides of each joint must evaluate to the same world position.
+ */
+function activateRagdoll(char) {
+  if (char.isPhysicsOn) return;
+  char.isPhysicsOn = true;
+
+  const { cx, cz } = ANAT;
+
+  // Switch every part to dynamic with its intended mass
+  char.parts.forEach(({ body, mass }) => {
+    body.mass = mass;
+    body.updateMassProperties();
+    body.type = CANNON.Body.DYNAMIC;
+    body.wakeUp();
+    body.linearDamping  = 0.02;
+    body.angularDamping = 0.05;
+  });
+
+  // Helper: create and register a PointToPoint constraint
+  function joint(bodyA, pivA, bodyB, pivB) {
+    const c = new CANNON.PointToPointConstraint(bodyA, pivA, bodyB, pivB);
+    physicsWorld.addConstraint(c);
+    char.constraints.push(c);
+  }
+
+  const V = (x, y, z) => new CANNON.Vec3(x, y, z);
+
+  // Neck joint — world y = 1.40
+  // head centre 1.58  → local offset (0, -0.18, 0)
+  // torso centre 1.025 → local offset (0, +0.375, 0)
+  joint(char.headBody,  V(0, -0.18, 0),  char.torsoBody, V(0, 0.375, 0));
+
+  // Shoulder joints — world y = 1.25, x = ±0.28
+  // torso centre (0, 1.025) → local offset (±0.28, 0.225, 0)
+  // upper-arm centre (±0.28, 1.11) → local offset (0, 0.14, 0)
+  joint(char.torsoBody, V(-0.28, 0.225, 0), char.luaBody, V(0,  0.14, 0));
+  joint(char.torsoBody, V( 0.28, 0.225, 0), char.ruaBody, V(0,  0.14, 0));
+
+  // Elbow joints — world y = 0.97, x = ±0.28
+  // upper-arm centre (±0.28, 1.11) → local offset (0, -0.14, 0)
+  // forearm centre  (±0.28, 0.85) → local offset (0, 0.12, 0)
+  joint(char.luaBody, V(0, -0.14, 0), char.lfaBody, V(0, 0.12, 0));
+  joint(char.ruaBody, V(0, -0.14, 0), char.rfaBody, V(0, 0.12, 0));
+
+  // Hip joints — world y = 0.75, x = ±0.12
+  // torso centre (0, 1.025) → local offset (±0.12, -0.275, 0)
+  // thigh centre (±0.12, 0.55) → local offset (0, 0.20, 0)
+  joint(char.torsoBody, V(-0.12, -0.275, 0), char.lthBody, V(0, 0.20, 0));
+  joint(char.torsoBody, V( 0.12, -0.275, 0), char.rthBody, V(0, 0.20, 0));
+
+  // Knee joints — world y = 0.35, x = ±0.12
+  // thigh centre (±0.12, 0.55) → local offset (0, -0.20, 0)
+  // shin centre  (±0.12, 0.175) → local offset (0, 0.175, 0)
+  joint(char.lthBody, V(0, -0.20, 0), char.lshBody, V(0, 0.175, 0));
+  joint(char.rthBody, V(0, -0.20, 0), char.rshBody, V(0, 0.175, 0));
+}
+
+/** Remove character meshes from the scene and bodies from the physics world. */
+function destroyCharacter(char) {
+  if (!char) return;
+  char.constraints.forEach(c => physicsWorld.removeConstraint(c));
+  char.parts.forEach(({ mesh, body }) => {
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    physicsWorld.removeBody(body);
+  });
+  scene.remove(char.neckMesh);
+  char.neckMesh.geometry.dispose();
+  // faceDecalMesh is a child of headMesh; Three.js removes it from the
+  // scene automatically when headMesh is removed, but we still need to
+  // dispose its GPU resources.
+  if (char.faceDecalMesh) {
+    char.faceDecalMesh.geometry.dispose();
+    char.faceDecalMesh.material.dispose();
+  }
+  // skirtMesh is a child of torsoMesh and is removed with it.
+  if (char.skirtMesh) {
+    char.skirtMesh.geometry.dispose();
+    char.skirtMesh.material.dispose();
+  }
+}
+
+/**
+ * Each frame: copy the Cannon body positions/rotations to the Three.js meshes.
+ * Also positions the visual-only neck mesh between head and torso.
+ */
+function syncCharacterToPhysics(char) {
+  if (!char) return;
+  char.parts.forEach(({ mesh, body }) => {
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);
+  });
+
+  // Neck: interpolate between head bottom and torso top
+  const h = char.headBody.position;
+  const t = char.torsoBody.position;
+  char.neckMesh.position.set(
+    (h.x + t.x) / 2,
+    h.y - 0.22,
+    (h.z + t.z) / 2
+  );
+}
+
+/**
+ * Reset the character to its standing pose (move all bodies back to
+ * their original positions and switch back to STATIC so it holds the pose).
+ */
+function resetCharacterPose(char) {
+  if (!char) return;
+
+  // Cancel any in-progress return animation
+  returnAnimation = null;
+
+  // Remove constraints from physics world
+  char.constraints.forEach(c => physicsWorld.removeConstraint(c));
+  char.constraints = [];
+  char.isPhysicsOn = false;
+
+  const { cx, cz } = ANAT;
+
+  // Original standing positions for each named part
+  const poses = {
+    head:         { x: cx,        y: 1.58,  z: cz },
+    torso:        { x: cx,        y: 1.025, z: cz },
+    leftUpperArm: { x: cx - 0.28, y: 1.11,  z: cz },
+    rightUpperArm:{ x: cx + 0.28, y: 1.11,  z: cz },
+    leftForeArm:  { x: cx - 0.28, y: 0.85,  z: cz },
+    rightForeArm: { x: cx + 0.28, y: 0.85,  z: cz },
+    leftThigh:    { x: cx - 0.12, y: 0.55,  z: cz },
+    rightThigh:   { x: cx + 0.12, y: 0.55,  z: cz },
+    leftShin:     { x: cx - 0.12, y: 0.175, z: cz },
+    rightShin:    { x: cx + 0.12, y: 0.175, z: cz },
+  };
+
+  char.parts.forEach(({ name, mesh, body }) => {
+    const p = poses[name];
+    if (!p) return;
+
+    // Reset Cannon body
+    body.mass = 0;
+    body.updateMassProperties();
+    body.type = CANNON.Body.STATIC;
+    body.velocity.set(0, 0, 0);
+    body.angularVelocity.set(0, 0, 0);
+    body.position.set(p.x, p.y, p.z);
+    body.quaternion.set(0, 0, 0, 1);
+    body.force.set(0, 0, 0);
+    body.torque.set(0, 0, 0);
+
+    // Mirror to Three.js mesh
+    mesh.position.set(p.x, p.y, p.z);
+    mesh.quaternion.set(0, 0, 0, 1);
+  });
+}
+
+
+// ================================================================
+// 5.  FACE DETECTION & TEXTURE CREATION
+// ================================================================
+
+/** Load the lightweight TinyFaceDetector model weights. */
+async function loadFaceModels() {
+  // Try the locally-bundled weights first (no network needed).
+  // Fall back to the CDN only if the local load fails (e.g. running from
+  // a file:// URL where relative paths resolve differently).
+  try {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL);
+  } catch (_err) {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL_CDN);
+  }
+}
+
+/**
+ * Detect the largest face in `imgElement`, crop it with padding, apply a
+ * circular mask so the texture sits naturally on the spherical head, and
+ * return a Three.js CanvasTexture.
+ *
+ * Falls back to using the entire image when no face is detected.
+ *
+ * @param {HTMLImageElement} imgElement
+ * @returns {Promise<THREE.CanvasTexture>}
+ */
+async function detectAndCropFace(imgElement) {
+  // Retry with progressively-larger input sizes to improve reliability.
+  // A small size is fast and good for close-up portraits; a larger size
+  // catches faces that occupy only a small region of the photo.
+  let detection = null;
+  for (const inputSize of FACE_DETECT_INPUT_SIZES) {
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize,
+      scoreThreshold: 0.25,
+    });
+    detection = await faceapi.detectSingleFace(imgElement, opts);
+    if (detection) break;
+  }
+
+  const SIZE = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width  = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext('2d');
+
+  if (detection) {
+    setLoadingText('Face detected! Cropping…');
+    // Crop with 38% padding on each side so the full face fits comfortably
+    const { x, y, width, height } = detection.box;
+    const pad = Math.max(width, height) * FACE_CROP_PADDING_RATIO;
+    const sx  = Math.max(0, x - pad);
+    const sy  = Math.max(0, y - pad);
+    const sw  = Math.min(imgElement.naturalWidth  - sx, width  + pad * 2);
+    const sh  = Math.min(imgElement.naturalHeight - sy, height + pad * 2);
+    ctx.drawImage(imgElement, sx, sy, sw, sh, 0, 0, SIZE, SIZE);
+  } else {
+    setLoadingText('No face detected — using full image.');
+    // No face found — use the whole image
+    ctx.drawImage(imgElement, 0, 0, SIZE, SIZE);
+  }
+
+  // Apply circular mask so the edges of the face texture are transparent
+  // (this prevents ugly rectangular seams on the head sphere)
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.beginPath();
+  ctx.arc(SIZE / 2, SIZE / 2, SIZE / 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+
+  return new THREE.CanvasTexture(canvas);
+}
+
+
+// ================================================================
+// 6.  SLAP INPUT  (mouse + touch)
+// ================================================================
+
+/** Attach pointer/touch listeners to the canvas. */
+function initSlapInput() {
+  const canvas = document.getElementById('game-canvas');
+
+  canvas.addEventListener('mousedown',  onPointerDown);
+  canvas.addEventListener('mousemove',  onPointerMove);
+  canvas.addEventListener('mouseup',    onPointerUp);
+  canvas.addEventListener('mouseleave', onPointerCancel);
+
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); onPointerDown(e.touches[0]); },        { passive: false });
+  canvas.addEventListener('touchmove',  e => { e.preventDefault(); onPointerMove(e.touches[0]); },        { passive: false });
+  canvas.addEventListener('touchend',   e => { e.preventDefault(); onPointerUp(e.changedTouches[0]); },   { passive: false });
+  canvas.addEventListener('touchcancel',e => { e.preventDefault(); onPointerCancel(); },                  { passive: false });
+}
+
+function onPointerDown(e) {
+  if (gameState !== STATE.READY) return;
+  pointerIsDown = true;
+  swipeStart = { x: e.clientX, y: e.clientY, time: performance.now() };
+  document.body.classList.add('swiping');
+}
+
+function onPointerMove(e) {
+  // Nothing to track here beyond what onPointerUp uses; kept for future enhancements.
+}
+
+function onPointerUp(e) {
+  if (!pointerIsDown || gameState !== STATE.READY) {
+    onPointerCancel();
+    return;
+  }
+  onPointerCancel();
+
+  const dx   = e.clientX - swipeStart.x;
+  const dy   = e.clientY - swipeStart.y;
+  const dist = Math.hypot(dx, dy);
+  const dt   = Math.max(8, performance.now() - swipeStart.time) / 1000; // seconds
+
+  // Ignore tiny accidental movements
+  if (dist < 22) return;
+
+  // Swipe speed in px/s → physics force magnitude (capped)
+  const speed    = dist / dt;
+  const forceMag = Math.min(BASE_FORCE + speed * FORCE_SPEED_MULTIPLIER, MAX_FORCE);
+
+  // Normalised swipe direction, converting screen-Y (inverted) to world-Y
+  const dirX = dx / dist;
+  const dirY = -(dy / dist); // screen down = negative world-Y
+
+  applySlap(dirX, dirY, forceMag);
+}
+
+function onPointerCancel() {
+  pointerIsDown = false;
+  document.body.classList.remove('swiping');
+}
+
+/**
+ * Convert the player's swipe gesture into a physics impulse on the ragdoll head.
+ *
+ * @param {number} dirX - Normalised horizontal swipe component.
+ * @param {number} dirY - Normalised vertical swipe component (world space).
+ * @param {number} force - Impulse magnitude (N·s).
+ */
+function applySlap(dirX, dirY, force) {
+  if (!character) return;
+
+  // Activate physics if this is the first slap
+  activateRagdoll(character);
+
+  // Record origin for distance tracking
+  const hp = character.headBody.position;
+  slapOrigin.set(hp.x, 0, hp.z);
+  maxFlyDist = 0;
+  gameState  = STATE.FLYING;
+  setHintText('');
+
+  // Impulse on head: horizontal swipe + upward toss + strong push away from camera
+  const impulse = new CANNON.Vec3(
+    dirX * force,
+    Math.abs(dirY) * force * 0.55 + force * 0.30, // always some upward force
+    -force * 1.1                                   // strong push deep into the scene
+  );
+  character.headBody.applyImpulse(impulse, character.headBody.position);
+
+  // Lighter impulse on the torso so the whole body follows
+  const bodyImpulse = new CANNON.Vec3(
+    dirX * force * 0.45,
+    force * 0.12,
+    -force * 0.55
+  );
+  character.torsoBody.applyImpulse(bodyImpulse, character.torsoBody.position);
+}
+
+
+// ================================================================
+// 7.  SCORE SYSTEM
+// ================================================================
+
+/**
+ * Called every frame while the character is in the FLYING state.
+ * Tracks the maximum horizontal distance and detects landing.
+ */
+function tickScore() {
+  if (!character || gameState !== STATE.FLYING) return;
+
+  const hp   = character.headBody.position;
+  const dist = Math.hypot(hp.x - slapOrigin.x, hp.z - slapOrigin.z);
+  if (dist > maxFlyDist) {
+    maxFlyDist = dist;
+    setDistanceDisplay(maxFlyDist);
+  }
+
+  // Detect landing: head is close to the floor and moving slowly
+  const vel   = character.headBody.velocity;
+  const speed = Math.hypot(vel.x, vel.y, vel.z);
+  if (hp.y < LANDING_HEIGHT_THRESHOLD && speed < LANDING_SPEED_THRESHOLD && maxFlyDist > 0) {
+    onCharacterLanded();
+    return;
+  }
+
+  // Check for building collisions while airborne
+  checkBuildingCollisions();
+}
+
+/** Trigger the end-of-slap UI after the character comes to rest. */
+function onCharacterLanded() {
+  gameState = STATE.RETURNING;
+  showCombo(maxFlyDist);
+  setHintText('Getting up… 🧍‍♀️');
+  beginReturnAnimation(character);
+}
+
+/** Pick and display a combo message based on distance flown. */
+function showCombo(dist) {
+  // Find the highest-threshold combo that the distance qualifies for
+  let chosen = COMBOS[0];
+  for (const c of COMBOS) {
+    if (dist >= c.min) chosen = c;
+  }
+
+  const el  = document.getElementById('combo-text');
+  el.textContent  = chosen.text;
+  el.style.color  = chosen.color;
+  el.style.textShadow = `0 0 18px ${chosen.color}, 3px 3px 0 #000`;
+
+  // Pop in, then fade out
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+function setDistanceDisplay(d) {
+  document.getElementById('dist-value').textContent = d.toFixed(1) + ' m';
+}
+
+
+// ================================================================
+// 7b. RETURN ANIMATION — character gets back up and walks to origin
+// ================================================================
+
+/** Cubic ease-in-out: smooth start and end for the return glide. */
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+/**
+ * Freeze physics, snapshot current poses, and schedule the 2-phase
+ * return animation (fast get-up → walk back to origin).
+ *
+ * @param {object} char - The active character object.
+ */
+function beginReturnAnimation(char) {
+  if (!char) return;
+
+  // Disable all physics — stop ragdoll motion immediately
+  char.constraints.forEach(c => physicsWorld.removeConstraint(c));
+  char.constraints = [];
+  char.isPhysicsOn = false;
+
+  char.parts.forEach(({ body }) => {
+    body.velocity.set(0, 0, 0);
+    body.angularVelocity.set(0, 0, 0);
+    body.mass = 0;
+    body.updateMassProperties();
+    body.type = CANNON.Body.STATIC;
+  });
+
+  // Snapshot current world-space pose of every ragdoll part
+  const startPoses = {};
+  char.parts.forEach(({ name, body }) => {
+    startPoses[name] = {
+      pos:  new THREE.Vector3(body.position.x,    body.position.y,    body.position.z),
+      quat: new THREE.Quaternion(body.quaternion.x, body.quaternion.y,
+                                 body.quaternion.z, body.quaternion.w),
+    };
+  });
+
+  // Landing root position (used as the origin of the get-up animation)
+  const landX = char.torsoBody.position.x;
+  const landZ = char.torsoBody.position.z;
+
+  returnAnimation = {
+    startTime: performance.now() + RETURN_PAUSE_MS,
+    startPoses,
+    landX,
+    landZ,
+    char,
+    walkHintShown: false, // ensures the walk hint is set only once
+  };
+}
+
+/**
+ * Called every frame: smoothly interpolates each ragdoll part from its
+ * post-slap position back to the standing pose, then transitions to READY.
+ */
+function tickReturn() {
+  if (gameState !== STATE.RETURNING || !returnAnimation) return;
+
+  const now = performance.now();
+  if (now < returnAnimation.startTime) return; // still in the initial pause
+
+  const elapsed = now - returnAnimation.startTime;
+  const { startPoses, landX, landZ, char } = returnAnimation;
+  const { cx, cz } = ANAT;
+  const identQuat = new THREE.Quaternion(); // (0,0,0,1)
+
+  // ---- Phase 1: GET UP (elapsed 0 → GETUP_DURATION_MS) --------------------
+  if (elapsed < GETUP_DURATION_MS) {
+    const tGetup = elapsed / GETUP_DURATION_MS; // [0, 1)
+
+    // Quaternion is fully restored to upright by the end of the gather
+    // sub-phase; after that it stays at identity.
+    const quatProgress = Math.min(tGetup / GATHER_FRAC, 1);
+    // Reuse a single quaternion instance — avoids per-part allocations
+    const slerpQ = new THREE.Quaternion();
+
+    char.parts.forEach(({ name, body, mesh }) => {
+      const sp = startPoses[name];
+      if (!sp) return;
+
+      let targetPos, posT;
+
+      if (tGetup < GATHER_FRAC) {
+        // Sub-phase 1a — gather scattered parts into a low crouch
+        targetPos = crouchPosAt(name, landX, landZ);
+        posT = easeInOutCubic(tGetup / GATHER_FRAC);
+      } else {
+        // Sub-phase 1b — rise smoothly from crouch to full standing height
+        const tt = (tGetup - GATHER_FRAC) / (1 - GATHER_FRAC);
+        posT = easeInOutCubic(tt);
+        // Lerp: crouch → standing  (start is crouchPos, not ragdoll pos)
+        const crouchP = crouchPosAt(name, landX, landZ);
+        const standP  = standingPosAt(name, landX, landZ);
+        targetPos = new THREE.Vector3().lerpVectors(crouchP, standP, posT);
+        // Override posT since we already computed the lerped position above
+        // — write it directly and return early.
+        slerpQ.slerpQuaternions(sp.quat, identQuat, quatProgress);
+        body.position.set(targetPos.x, targetPos.y, targetPos.z);
+        body.quaternion.set(slerpQ.x, slerpQ.y, slerpQ.z, slerpQ.w);
+        mesh.position.copy(targetPos);
+        mesh.quaternion.copy(slerpQ);
+        return;
+      }
+
+      // Sub-phase 1a path — generic lerp from ragdoll → crouch
+      const lerpPos = new THREE.Vector3().lerpVectors(sp.pos, targetPos, posT);
+      slerpQ.slerpQuaternions(sp.quat, identQuat, quatProgress);
+      body.position.set(lerpPos.x, lerpPos.y, lerpPos.z);
+      body.quaternion.set(slerpQ.x, slerpQ.y, slerpQ.z, slerpQ.w);
+      mesh.position.copy(lerpPos);
+      mesh.quaternion.copy(slerpQ);
+    });
+    return;
+  }
+
+  // ---- Phase 2: WALK BACK (elapsed GETUP_DURATION_MS → +WALK_DURATION_MS) -
+  const tWalk = Math.min((elapsed - GETUP_DURATION_MS) / WALK_DURATION_MS, 1);
+  const etWalk = easeInOutCubic(tWalk);
+
+  // Root x/z slides from landing spot to origin
+  const rootX = landX + (cx - landX) * etWalk;
+  const rootZ = landZ + (cz - landZ) * etWalk;
+
+  // Walking oscillation: step frequency tied to progress so the walk looks
+  // natural regardless of actual horizontal distance.
+  const phase   = tWalk * WALK_STEP_CYCLES * Math.PI * 2;
+  const bodyBob = Math.abs(Math.sin(phase)) * 0.03; // subtle up-bob on each step
+
+  // Show the walk hint exactly once when entering this phase
+  if (!returnAnimation.walkHintShown) {
+    returnAnimation.walkHintShown = true;
+    setHintText('Walking back… 👟');
+  }
+
+  char.parts.forEach(({ name, body, mesh }) => {
+    const sp = standingPosAt(name, rootX, rootZ);
+    if (!sp) return;
+
+    // Leg swing: left and right legs alternate; arms swing opposite
+    let dy = 0;
+    if (name === 'leftThigh'  || name === 'leftShin')    dy =  Math.sin(phase) * 0.08;
+    if (name === 'rightThigh' || name === 'rightShin')   dy = -Math.sin(phase) * 0.08;
+    if (name === 'leftUpperArm'  || name === 'leftForeArm')  dy = -Math.sin(phase) * 0.05;
+    if (name === 'rightUpperArm' || name === 'rightForeArm') dy =  Math.sin(phase) * 0.05;
+
+    // Keep shins above the floor
+    const finalY = Math.max(sp.y + dy + bodyBob, 0.05);
+    body.position.set(sp.x, finalY, sp.z);
+    body.quaternion.set(0, 0, 0, 1);
+    mesh.position.set(sp.x, finalY, sp.z);
+    mesh.quaternion.set(0, 0, 0, 1);
+  });
+
+  if (tWalk >= 1) {
+    // Snap every part to the clean standing pose at the origin
+    char.parts.forEach(({ name, body, mesh }) => {
+      const sp = standingPosAt(name, cx, cz);
+      if (!sp) return;
+      body.position.set(sp.x, sp.y, sp.z);
+      body.quaternion.set(0, 0, 0, 1);
+      mesh.position.set(sp.x, sp.y, sp.z);
+      mesh.quaternion.set(0, 0, 0, 1);
+    });
+    returnAnimation = null;
+    gameState = STATE.READY;
+    setHintText('🖱️ Drag to SLAP again!');
+  }
+}
+
+/**
+ * World-space standing pose position for the named body part, rooted at (rx, rz).
+ * Returns null for unknown part names.
+ *
+ * @param {string} name
+ * @param {number} rx - Root X coordinate.
+ * @param {number} rz - Root Z coordinate.
+ * @returns {THREE.Vector3|null}
+ */
+function standingPosAt(name, rx, rz) {
+  switch (name) {
+    case 'head':          return new THREE.Vector3(rx,        1.58,  rz);
+    case 'torso':         return new THREE.Vector3(rx,        1.025, rz);
+    case 'leftUpperArm':  return new THREE.Vector3(rx - 0.28, 1.11,  rz);
+    case 'rightUpperArm': return new THREE.Vector3(rx + 0.28, 1.11,  rz);
+    case 'leftForeArm':   return new THREE.Vector3(rx - 0.28, 0.85,  rz);
+    case 'rightForeArm':  return new THREE.Vector3(rx + 0.28, 0.85,  rz);
+    case 'leftThigh':     return new THREE.Vector3(rx - 0.12, 0.55,  rz);
+    case 'rightThigh':    return new THREE.Vector3(rx + 0.12, 0.55,  rz);
+    case 'leftShin':      return new THREE.Vector3(rx - 0.12, 0.175, rz);
+    case 'rightShin':     return new THREE.Vector3(rx + 0.12, 0.175, rz);
+    default:              return null;
+  }
+}
+
+/**
+ * World-space crouching pose position for the named body part, rooted at (rx, rz).
+ * All parts cluster close to the floor — used as the midpoint in the get-up sequence.
+ *
+ * @param {string} name
+ * @param {number} rx
+ * @param {number} rz
+ * @returns {THREE.Vector3|null}
+ */
+function crouchPosAt(name, rx, rz) {
+  switch (name) {
+    case 'head':          return new THREE.Vector3(rx,        0.72,  rz);
+    case 'torso':         return new THREE.Vector3(rx,        0.46,  rz);
+    case 'leftUpperArm':  return new THREE.Vector3(rx - 0.22, 0.44,  rz);
+    case 'rightUpperArm': return new THREE.Vector3(rx + 0.22, 0.44,  rz);
+    case 'leftForeArm':   return new THREE.Vector3(rx - 0.22, 0.30,  rz);
+    case 'rightForeArm':  return new THREE.Vector3(rx + 0.22, 0.30,  rz);
+    case 'leftThigh':     return new THREE.Vector3(rx - 0.12, 0.25,  rz);
+    case 'rightThigh':    return new THREE.Vector3(rx + 0.12, 0.25,  rz);
+    case 'leftShin':      return new THREE.Vector3(rx - 0.10, 0.07,  rz);
+    case 'rightShin':     return new THREE.Vector3(rx + 0.10, 0.07,  rz);
+    default:              return null;
+  }
+}
+
+
+// ================================================================
+// 7c.  DESTRUCTIBLE BUILDINGS
+// ================================================================
+
+/**
+ * Specifications for each building in the scene.
+ * x/z = centre position (world), w/h/d = width/height/depth,
+ * floors = number of independently-physics floor slabs,
+ * color = hex integer for the concrete material.
+ */
+const BUILDING_SPECS = [
+  { x:  0,    z: -12,  w: 4.5, h: 10, d: 3.5, floors: 4, color: 0x5a6a7a },
+  { x: -6.5,  z: -21,  w: 3.5, h: 13, d: 3.0, floors: 5, color: 0x4a5f70 },
+  { x:  5.5,  z: -21,  w: 3.0, h:  9, d: 2.5, floors: 3, color: 0x607080 },
+  { x:  0.5,  z: -36,  w: 6.0, h: 18, d: 4.0, floors: 6, color: 0x3a4a5a },
+  { x: -5.0,  z: -54,  w: 5.0, h: 22, d: 4.0, floors: 8, color: 0x2a3a4a },
+  { x:  6.0,  z: -54,  w: 4.0, h: 16, d: 3.5, floors: 6, color: 0x354555 },
+];
+
+/**
+ * Spawn all destructible buildings.
+ * Destroys any previously existing buildings first.
+ */
+function initBuildings() {
+  destroyBuildings();
+
+  for (const spec of BUILDING_SPECS) {
+    const building = { bodies: [], meshes: [], broken: false, spec };
+    const floorH = spec.h / spec.floors;
+
+    for (let i = 0; i < spec.floors; i++) {
+      const y = floorH / 2 + i * floorH;
+
+      // --- Visual mesh: concrete slab -------------------------
+      const slabMat = new THREE.MeshStandardMaterial({
+        color:     spec.color,
+        roughness: 0.85,
+        metalness: 0.05,
+      });
+      const slab = new THREE.Mesh(
+        new THREE.BoxGeometry(spec.w, floorH * 0.92, spec.d),
+        slabMat
+      );
+      slab.position.set(spec.x, y, spec.z);
+      slab.castShadow    = true;
+      slab.receiveShadow = true;
+      scene.add(slab);
+      building.meshes.push(slab);
+
+      // --- Window panel: child of slab (follows tumble) ------
+      const winMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(spec.w * 0.78, floorH * 0.52, 0.06),
+        new THREE.MeshStandardMaterial({
+          color:            0x223344,
+          emissive:         0x334466,
+          emissiveIntensity: Math.random() * 0.45 + 0.08,
+          roughness:        0.3,
+          metalness:        0.5,
+        })
+      );
+      // Place on the +Z (camera-facing) face of the slab
+      winMesh.position.set(0, 0, spec.d / 2 + 0.04);
+      slab.add(winMesh);
+
+      // --- Physics body (STATIC until struck) ----------------
+      const body = new CANNON.Body({ mass: 0 });
+      body.addShape(new CANNON.Box(
+        new CANNON.Vec3(spec.w / 2, floorH / 2, spec.d / 2)
+      ));
+      body.position.set(spec.x, y, spec.z);
+      body.type       = CANNON.Body.STATIC;
+      body.allowSleep = false;
+      physicsWorld.addBody(body);
+      building.bodies.push(body);
+    }
+
+    buildings.push(building);
+  }
+}
+
+/**
+ * Make a building crumble: switch all its floor bodies to DYNAMIC and
+ * kick them outward so they tumble realistically.
+ *
+ * @param {object} building  - Entry from the `buildings` array.
+ * @param {number} impactY   - World-Y of impact (upper floors get more scatter).
+ */
+function crumbleBuilding(building, impactY) {
+  if (building.broken) return;
+  building.broken = true;
+
+  const floorH = building.spec.h / building.spec.floors;
+
+  building.bodies.forEach((body, i) => {
+    const floorY    = floorH / 2 + i * floorH;
+    const isAbove   = floorY > (impactY || 0);
+    const scatter   = isAbove ? 2.2 : 0.8;
+
+    body.mass = 60 + i * 25;
+    body.updateMassProperties();
+    body.type = CANNON.Body.DYNAMIC;
+    body.wakeUp();
+
+    body.applyImpulse(
+      new CANNON.Vec3(
+        (Math.random() - 0.5) * scatter * 12,
+        isAbove ? Math.random() * 8 + 3 : Math.random() * 3,
+        (Math.random() - 0.5) * scatter * 8
+      ),
+      new CANNON.Vec3(
+        body.position.x + (Math.random() - 0.5) * 0.6,
+        body.position.y,
+        body.position.z + (Math.random() - 0.5) * 0.6
+      )
+    );
+  });
+
+  // Flash the combo display
+  const el = document.getElementById('combo-text');
+  el.textContent      = '🏗️ BUILDING DESTROYED! 💥';
+  el.style.color      = '#ff8800';
+  el.style.textShadow = '0 0 18px #ff8800, 3px 3px 0 #000';
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+/**
+ * Proximity-based building-collision check.
+ * Called every frame while the character is FLYING.
+ * Triggers crumble when the character's head enters a building's AABB
+ * (with a generous 2.8 m detection margin to beat the physics at high speed).
+ */
+function checkBuildingCollisions() {
+  if (!character) return;
+  const hp = character.headBody.position;
+
+  for (const building of buildings) {
+    if (building.broken) continue;
+    const { spec } = building;
+    const dx = Math.abs(hp.x - spec.x) - spec.w * 0.5;
+    const dz = Math.abs(hp.z - spec.z) - spec.d * 0.5;
+    if (dx < BUILDING_COLLISION_MARGIN && dz < BUILDING_COLLISION_MARGIN &&
+        hp.y > -0.5 && hp.y < spec.h + BUILDING_COLLISION_MARGIN) {
+      crumbleBuilding(building, hp.y);
+      return; // one building per frame is enough
+    }
+  }
+}
+
+/**
+ * Each frame: sync crumbling floor-slab meshes to their now-dynamic bodies.
+ * Window panels are children of the slab mesh and follow automatically.
+ */
+function tickBuildings() {
+  for (const building of buildings) {
+    if (!building.broken) continue;
+    building.bodies.forEach((body, i) => {
+      const mesh = building.meshes[i];
+      mesh.position.copy(body.position);
+      mesh.quaternion.copy(body.quaternion);
+    });
+  }
+}
+
+/**
+ * Remove all building meshes from the scene and bodies from physics world.
+ */
+function destroyBuildings() {
+  for (const building of buildings) {
+    building.bodies.forEach(body => physicsWorld.removeBody(body));
+    building.meshes.forEach(mesh => {
+      scene.remove(mesh);
+      mesh.geometry.dispose();
+      mesh.material.dispose();
+    });
+  }
+  buildings = [];
+}
+
+
+// ================================================================
+// 7d.  CAMERA FOLLOW
+// ================================================================
+
+/**
+ * Smoothly track the flying character; return to the default position
+ * once the character lands and walks back.
+ */
+function tickCamera() {
+  if (!character) return;
+  const hp = character.headBody.position;
+
+  if (gameState === STATE.FLYING) {
+    // Stay 8 m behind character in Z, follow X and Y gently
+    const tgtX = hp.x * 0.45;
+    const tgtY = Math.max(1.6, hp.y * 0.35 + 1.8);
+    const tgtZ = Math.min(4.0, hp.z + 8);   // never move in front of start
+
+    camera.position.x += (tgtX - camera.position.x) * 0.06;
+    camera.position.y += (tgtY - camera.position.y) * 0.06;
+    camera.position.z += (tgtZ - camera.position.z) * 0.06;
+    camera.lookAt(hp.x, Math.max(0.3, hp.y * 0.7), hp.z);
+
+  } else if (gameState === STATE.RETURNING || gameState === STATE.READY) {
+    // Glide back to default
+    camera.position.x += (CAM_DEFAULT_POS.x - camera.position.x) * 0.05;
+    camera.position.y += (CAM_DEFAULT_POS.y - camera.position.y) * 0.05;
+    camera.position.z += (CAM_DEFAULT_POS.z - camera.position.z) * 0.05;
+    camera.lookAt(CAM_DEFAULT_LOOK);
+  }
+}
+// ================================================================
+
+function showScreen(id) {
+  document.getElementById('start-screen').style.display  = 'none';
+  document.getElementById('loading-screen').style.display = 'none';
+  document.getElementById('game-ui').style.display       = 'none';
+
+  if (id === 'start')   document.getElementById('start-screen').style.display   = 'flex';
+  if (id === 'loading') document.getElementById('loading-screen').style.display  = 'flex';
+  if (id === 'game')    document.getElementById('game-ui').style.display         = 'block';
+}
+
+function setLoadingText(msg) {
+  document.getElementById('loading-text').textContent = msg;
+}
+
+function setHintText(msg) {
+  const el = document.getElementById('hint-text');
+  el.textContent   = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function showUploadError(msg) {
+  document.getElementById('upload-error').textContent = msg;
+}
+
+function clearUploadError() {
+  document.getElementById('upload-error').textContent = '';
+}
+
+
+// ================================================================
+// 9.  ANIMATION LOOP
+// ================================================================
+
+function animate(timestamp) {
+  requestAnimationFrame(animate);
+
+  // Advance physics simulation
+  if (lastTimestamp !== null) {
+    const elapsed = (timestamp - lastTimestamp) / 1000;
+    physicsWorld.step(FIXED_DT, elapsed, MAX_STEPS);
+  }
+  lastTimestamp = timestamp;
+
+  // Drive the return-to-standing animation (must run before sync)
+  tickReturn();
+
+  // Sync Three.js meshes to physics state
+  syncCharacterToPhysics(character);
+
+  // Track score while character is flying
+  tickScore();
+
+  // Sync crumbling building floor meshes
+  tickBuildings();
+
+  // Smooth camera follow / return
+  tickCamera();
+
+  renderer.render(scene, camera);
+}
+
+
+// ================================================================
+// 10. BOOTSTRAP — IMAGE UPLOAD & EVENT WIRING
+// ================================================================
+
+/**
+ * Full pipeline triggered when the player picks an image:
+ *   load models → decode image → detect face → build character → start game
+ */
+
+/**
+ * Returns null when the file is acceptable, or a human-readable error string
+ * when it should be rejected before any processing begins.
+ *
+ * @param {File} file
+ * @returns {string|null}
+ */
+function validateImageFile(file) {
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    return 'Image is too large (max 20 MB). Please choose a smaller file.';
+  }
+  // Accept any MIME type that starts with "image/"
+  if (file.type && file.type.startsWith('image/')) return null;
+  // If the browser did not supply a MIME type (common with HEIC/HEIF/AVIF on
+  // some platforms), fall back to the file-name extension.
+  const extParts = file.name.split('.');
+  const ext = extParts.length > 1 ? extParts.pop().toLowerCase() : '';
+  if (ext && ACCEPTED_IMAGE_EXTS.has(ext)) return null;
+  return `Unsupported file "${file.name}". Please upload an image (JPG, PNG, WEBP, HEIC, etc.).`;
+}
+
+async function handleImageUpload(file) {
+  clearUploadError();
+
+  // Validate type and size before showing the loading screen
+  const validationError = validateImageFile(file);
+  if (validationError) {
+    showUploadError(validationError);
+    return;
+  }
+
+  showScreen('loading');
+  gameState = STATE.LOADING;
+
+  try {
+    // 1. Load face-api.js TinyFaceDetector (no-op on subsequent calls)
+    setLoadingText('Loading face detection models…');
+    await loadFaceModels();
+
+    // 2. Decode the uploaded file into an HTMLImageElement
+    setLoadingText('Reading image…');
+    const objectURL = URL.createObjectURL(file);
+    const img = await loadImage(objectURL);
+    URL.revokeObjectURL(objectURL);
+
+    // 3. Detect face and build a canvas texture
+    setLoadingText('Detecting face…');
+    faceTexture = await detectAndCropFace(img);
+
+    // 4. Tear down any existing character
+    if (character) {
+      destroyCharacter(character);
+      character = null;
+    }
+
+    setLoadingText('Building ragdoll…');
+    await sleep(250); // brief pause for UX smoothness
+
+    // 5. Build the new standing character
+    character = createCharacter(faceTexture);
+
+    // 5b. (Re-)create destructible buildings
+    initBuildings();
+
+    // 6. Reset HUD and enter the game
+    setDistanceDisplay(0);
+    showScreen('game');
+    setHintText('🖱️ Drag to SLAP!');
+    gameState = STATE.READY;
+
+  } catch (err) {
+    console.error('[SlapSim] Image processing error:', err);
+    // Translate low-level network errors into plain English
+    const errMsg = (err.message || '').toLowerCase();
+    const isNetworkErr = errMsg.includes('failed to fetch') ||
+                         errMsg.includes('networkerror') ||
+                         errMsg.includes('load failed');
+    const msg = isNetworkErr
+      ? 'Could not load face-detection models (network error). Check your connection and try again.'
+      : 'Oops! ' + err.message + ' — Please try again.';
+    setLoadingText(msg);
+    await sleep(3000);
+    showScreen('start');
+    gameState = STATE.INTRO;
+  }
+}
+
+/** Decode a Blob URL into an HTMLImageElement. */
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload  = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not decode the image. The file may be corrupted or in an unsupported format.'));
+    img.src = src;
+  });
+}
+
+/** Promise-based sleep helper. */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Wire up all DOM event listeners. */
+function setupEvents() {
+
+  // File picker — triggered by the hidden <input type="file">
+  document.getElementById('face-upload').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    e.target.value = ''; // allow re-uploading the same file
+    if (file) await handleImageUpload(file);
+  });
+
+  // Restart button — keep current face, reset ragdoll pose and rebuild buildings
+  document.getElementById('restart-btn').addEventListener('click', () => {
+    if (!character) return;
+    if (gameState !== STATE.READY && gameState !== STATE.FLYING && gameState !== STATE.RETURNING) return;
+    resetCharacterPose(character);
+    initBuildings();
+    setDistanceDisplay(0);
+    maxFlyDist = 0;
+    gameState  = STATE.READY;
+    setHintText('🖱️ Drag to SLAP!');
+  });
+
+  // New face button — return to start screen
+  document.getElementById('new-face-btn').addEventListener('click', () => {
+    if (character) {
+      destroyCharacter(character);
+      character = null;
+    }
+    destroyBuildings();
+    faceTexture = null;
+    clearUploadError();
+    gameState   = STATE.INTRO;
+    showScreen('start');
+  });
+}
+
+/** Entry point: initialise everything and start the render loop. */
+async function main() {
+  initRenderer();
+  initLights();
+  initRoom();
+  initPhysics();
+  initSlapInput();
+  setupEvents();
+
+  showScreen('start');
+  requestAnimationFrame(animate);
+}
+
+main();

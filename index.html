@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Slap Simulator 👋</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ===== START SCREEN ===== -->
+  <div id="start-screen">
+    <div class="start-content">
+      <h1 class="game-title">👋 SLAP<br>SIMULATOR</h1>
+      <p class="subtitle">Upload a face. Slap it. Watch it fly.</p>
+
+      <label class="upload-btn" for="face-upload">
+        📷 UPLOAD A FACE
+      </label>
+      <input type="file" id="face-upload" accept="image/*,.heic,.heif,.avif" />
+
+      <p id="upload-error" aria-live="polite"></p>
+      <p class="hint">JPG · PNG · WEBP · HEIC &amp; more — runs fully in your browser</p>
+    </div>
+  </div>
+
+  <!-- ===== LOADING SCREEN ===== -->
+  <div id="loading-screen">
+    <div class="loading-content">
+      <div class="spinner"></div>
+      <p id="loading-text">Loading…</p>
+    </div>
+  </div>
+
+  <!-- ===== 3-D CANVAS ===== -->
+  <canvas id="game-canvas"></canvas>
+
+  <!-- ===== GAME HUD ===== -->
+  <div id="game-ui">
+
+    <!-- Distance readout -->
+    <div id="score-box">
+      <div id="dist-label">DISTANCE</div>
+      <div id="dist-value">0.0 m</div>
+    </div>
+
+    <!-- Big combo pop-up -->
+    <div id="combo-text"></div>
+
+    <!-- Bottom instruction -->
+    <div id="hint-text">🖱️ Drag to SLAP!</div>
+
+    <!-- Action buttons -->
+    <div id="action-buttons">
+      <button id="restart-btn">🔄 RESTART</button>
+      <button id="new-face-btn">📷 NEW FACE</button>
+    </div>
+
+  </div>
+
+  <!-- ===== CDN LIBRARIES =====
+       NOTE: For production deployments, replace these CDN links with
+       locally-hosted copies OR add `integrity="sha384-..."` SRI hashes
+       (generate them at https://www.srihash.org/).
+       The `crossorigin` attribute is included to enable SRI enforcement
+       should hashes be added later.
+  -->
+  <!-- Three.js r128 -->
+  <script crossorigin="anonymous" src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- Cannon.js 0.6.2 physics -->
+  <script crossorigin="anonymous" src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+  <!-- face-api.js face detection -->
+  <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+  <script src="main.js"></script>
+</body>
+</html>
