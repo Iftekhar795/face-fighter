@@ -45,6 +45,24 @@ const FORCE_SPEED_MULTIPLIER = 0.07;
 /** Fraction of head-bounding-box used as padding when cropping the face. */
 const FACE_CROP_PADDING_RATIO = 0.38;
 
+/** Maximum image file size (bytes) accepted before processing begins. */
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
+
+/**
+ * File-name extensions accepted when the browser reports no MIME type
+ * (common with HEIC / HEIF / AVIF on some platforms).
+ */
+const ACCEPTED_IMAGE_EXTS = new Set([
+  'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp',
+  'tif', 'tiff', 'heic', 'heif', 'avif', 'jfif',
+]);
+
+/**
+ * TinyFaceDetector input sizes tried in order (smallest → largest).
+ * Retrying with a larger input size catches faces that the small pass misses.
+ */
+const FACE_DETECT_INPUT_SIZES = [160, 224, 320, 416];
+
 /** Head Y position (metres) below which we consider the character "landed". */
 const LANDING_HEIGHT_THRESHOLD = 0.6;
 
@@ -615,12 +633,18 @@ async function loadFaceModels() {
  * @returns {Promise<THREE.CanvasTexture>}
  */
 async function detectAndCropFace(imgElement) {
-  const opts = new faceapi.TinyFaceDetectorOptions({
-    inputSize:       224,
-    scoreThreshold:  0.3,
-  });
-
-  const detection = await faceapi.detectSingleFace(imgElement, opts);
+  // Retry with progressively-larger input sizes to improve reliability.
+  // A small size is fast and good for close-up portraits; a larger size
+  // catches faces that occupy only a small region of the photo.
+  let detection = null;
+  for (const inputSize of FACE_DETECT_INPUT_SIZES) {
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize,
+      scoreThreshold: 0.25,
+    });
+    detection = await faceapi.detectSingleFace(imgElement, opts);
+    if (detection) break;
+  }
 
   const SIZE = 256;
   const canvas = document.createElement('canvas');
@@ -629,7 +653,8 @@ async function detectAndCropFace(imgElement) {
   const ctx = canvas.getContext('2d');
 
   if (detection) {
-    // Crop with 35% padding on each side so the full face fits comfortably
+    setLoadingText('Face detected! Cropping…');
+    // Crop with 38% padding on each side so the full face fits comfortably
     const { x, y, width, height } = detection.box;
     const pad = Math.max(width, height) * FACE_CROP_PADDING_RATIO;
     const sx  = Math.max(0, x - pad);
@@ -638,6 +663,7 @@ async function detectAndCropFace(imgElement) {
     const sh  = Math.min(imgElement.naturalHeight - sy, height + pad * 2);
     ctx.drawImage(imgElement, sx, sy, sw, sh, 0, 0, SIZE, SIZE);
   } else {
+    setLoadingText('No face detected — using full image.');
     // No face found — use the whole image
     ctx.drawImage(imgElement, 0, 0, SIZE, SIZE);
   }
@@ -834,6 +860,14 @@ function setHintText(msg) {
   el.style.display = msg ? 'block' : 'none';
 }
 
+function showUploadError(msg) {
+  document.getElementById('upload-error').textContent = msg;
+}
+
+function clearUploadError() {
+  document.getElementById('upload-error').textContent = '';
+}
+
 
 // ================================================================
 // 9.  ANIMATION LOOP
@@ -867,7 +901,38 @@ function animate(timestamp) {
  * Full pipeline triggered when the player picks an image:
  *   load models → decode image → detect face → build character → start game
  */
+
+/**
+ * Returns null when the file is acceptable, or a human-readable error string
+ * when it should be rejected before any processing begins.
+ *
+ * @param {File} file
+ * @returns {string|null}
+ */
+function validateImageFile(file) {
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    return 'Image is too large (max 20 MB). Please choose a smaller file.';
+  }
+  // Accept any MIME type that starts with "image/"
+  if (file.type && file.type.startsWith('image/')) return null;
+  // If the browser did not supply a MIME type (common with HEIC/HEIF/AVIF on
+  // some platforms), fall back to the file-name extension.
+  const extParts = file.name.split('.');
+  const ext = extParts.length > 1 ? extParts.pop().toLowerCase() : '';
+  if (ext && ACCEPTED_IMAGE_EXTS.has(ext)) return null;
+  return `Unsupported file "${file.name}". Please upload an image (JPG, PNG, WEBP, HEIC, etc.).`;
+}
+
 async function handleImageUpload(file) {
+  clearUploadError();
+
+  // Validate type and size before showing the loading screen
+  const validationError = validateImageFile(file);
+  if (validationError) {
+    showUploadError(validationError);
+    return;
+  }
+
   showScreen('loading');
   gameState = STATE.LOADING;
 
@@ -918,7 +983,7 @@ function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload  = () => resolve(img);
-    img.onerror = () => reject(new Error('Could not read image file.'));
+    img.onerror = () => reject(new Error('Could not decode the image. The file may be corrupted or in an unsupported format.'));
     img.src = src;
   });
 }
@@ -955,6 +1020,7 @@ function setupEvents() {
       character = null;
     }
     faceTexture = null;
+    clearUploadError();
     gameState   = STATE.INTRO;
     showScreen('start');
   });
