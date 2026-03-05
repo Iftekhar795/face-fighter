@@ -41,13 +41,20 @@ const GRAVITY = -22;
 const ROOM_HALF = 10;
 
 /** Maximum impulse force that can be applied by one slap. */
-const MAX_FORCE = 110;
+const MAX_FORCE = 120;
 
-/** Minimum slap force added regardless of swipe speed. */
-const BASE_FORCE = 18;
+/**
+ * Tiny baseline force so that even a barely-qualifying swipe still does
+ * something visible.  Kept low so swipe speed is the dominant factor.
+ */
+const BASE_FORCE = 4;
 
-/** How much px/s of swipe speed contributes to slap force. */
-const FORCE_SPEED_MULTIPLIER = 0.07;
+/**
+ * How many Newtons per px/s of swipe speed.
+ * With this value a ~1 800 px/s swipe reaches MAX_FORCE.
+ * A slow 200 px/s swipe produces only ~16 N — a light push.
+ */
+const FORCE_SPEED_MULTIPLIER = 0.065;
 
 /** Fraction of head-bounding-box used as padding when cropping the face. */
 const FACE_CROP_PADDING_RATIO = 0.38;
@@ -71,10 +78,19 @@ const ACCEPTED_IMAGE_EXTS = new Set([
 const FACE_DETECT_INPUT_SIZES = [160, 224, 320, 416];
 
 /** How long to pause (ms) after landing before the return animation starts. */
-const RETURN_PAUSE_MS = 1000;
+const RETURN_PAUSE_MS = 300;
 
-/** Duration (ms) of the smooth return-to-standing animation. */
-const RETURN_DURATION_MS = 1600;
+/** Duration (ms) of the fast get-up phase (gather into crouch → rise to stand). */
+const GETUP_DURATION_MS = 650;
+
+/** Fraction of GETUP_DURATION_MS spent gathering the ragdoll parts into a crouch. */
+const GATHER_FRAC = 0.45;
+
+/** Duration (ms) of the walk-back phase once the character is standing. */
+const WALK_DURATION_MS = 950;
+
+/** Number of full step cycles during the walk-back phase. */
+const WALK_STEP_CYCLES = 2.5;
 const LANDING_HEIGHT_THRESHOLD = 0.6;
 
 /** Speed (m/s) below which a landed character is considered at rest. */
@@ -881,7 +897,7 @@ function tickScore() {
 function onCharacterLanded() {
   gameState = STATE.RETURNING;
   showCombo(maxFlyDist);
-  setHintText('Getting back up… 🧍‍♀️');
+  setHintText('Getting up… 🧍‍♀️');
   beginReturnAnimation(character);
 }
 
@@ -919,8 +935,8 @@ function easeInOutCubic(t) {
 }
 
 /**
- * Freeze physics, snapshot current poses, and schedule the smooth
- * return-to-standing animation.
+ * Freeze physics, snapshot current poses, and schedule the 2-phase
+ * return animation (fast get-up → walk back to origin).
  *
  * @param {object} char - The active character object.
  */
@@ -940,7 +956,7 @@ function beginReturnAnimation(char) {
     body.type = CANNON.Body.STATIC;
   });
 
-  // Snapshot current world-space pose of every part
+  // Snapshot current world-space pose of every ragdoll part
   const startPoses = {};
   char.parts.forEach(({ name, body }) => {
     startPoses[name] = {
@@ -950,11 +966,17 @@ function beginReturnAnimation(char) {
     };
   });
 
+  // Landing root position (used as the origin of the get-up animation)
+  const landX = char.torsoBody.position.x;
+  const landZ = char.torsoBody.position.z;
+
   returnAnimation = {
-    startTime:  performance.now() + RETURN_PAUSE_MS,
-    duration:   RETURN_DURATION_MS,
+    startTime: performance.now() + RETURN_PAUSE_MS,
     startPoses,
+    landX,
+    landZ,
     char,
+    walkHintShown: false, // ensures the walk hint is set only once
   };
 }
 
@@ -965,53 +987,164 @@ function beginReturnAnimation(char) {
 function tickReturn() {
   if (gameState !== STATE.RETURNING || !returnAnimation) return;
 
-  const now     = performance.now();
+  const now = performance.now();
   if (now < returnAnimation.startTime) return; // still in the initial pause
 
   const elapsed = now - returnAnimation.startTime;
-  const t       = Math.min(elapsed / returnAnimation.duration, 1);
-  const et      = easeInOutCubic(t);
-
+  const { startPoses, landX, landZ, char } = returnAnimation;
   const { cx, cz } = ANAT;
-  const targetPoses = {
-    head:          new THREE.Vector3(cx,        1.58,  cz),
-    torso:         new THREE.Vector3(cx,        1.025, cz),
-    leftUpperArm:  new THREE.Vector3(cx - 0.28, 1.11,  cz),
-    rightUpperArm: new THREE.Vector3(cx + 0.28, 1.11,  cz),
-    leftForeArm:   new THREE.Vector3(cx - 0.28, 0.85,  cz),
-    rightForeArm:  new THREE.Vector3(cx + 0.28, 0.85,  cz),
-    leftThigh:     new THREE.Vector3(cx - 0.12, 0.55,  cz),
-    rightThigh:    new THREE.Vector3(cx + 0.12, 0.55,  cz),
-    leftShin:      new THREE.Vector3(cx - 0.12, 0.175, cz),
-    rightShin:     new THREE.Vector3(cx + 0.12, 0.175, cz),
-  };
+  const identQuat = new THREE.Quaternion(); // (0,0,0,1)
 
-  const identQuat = new THREE.Quaternion();
-  const lerpPos   = new THREE.Vector3();
-  const slerpQuat = new THREE.Quaternion();
+  // ---- Phase 1: GET UP (elapsed 0 → GETUP_DURATION_MS) --------------------
+  if (elapsed < GETUP_DURATION_MS) {
+    const tGetup = elapsed / GETUP_DURATION_MS; // [0, 1)
 
-  returnAnimation.char.parts.forEach(({ name, body, mesh }) => {
-    const sp = returnAnimation.startPoses[name];
-    const tp = targetPoses[name];
-    if (!sp || !tp) return;
+    // Quaternion is fully restored to upright by the end of the gather
+    // sub-phase; after that it stays at identity.
+    const quatProgress = Math.min(tGetup / GATHER_FRAC, 1);
+    // Reuse a single quaternion instance — avoids per-part allocations
+    const slerpQ = new THREE.Quaternion();
 
-    lerpPos.lerpVectors(sp.pos, tp, et);
-    slerpQuat.slerpQuaternions(sp.quat, identQuat, et);
+    char.parts.forEach(({ name, body, mesh }) => {
+      const sp = startPoses[name];
+      if (!sp) return;
 
-    // Move the Cannon body (STATIC — physics won't fight us)
-    body.position.set(lerpPos.x, lerpPos.y, lerpPos.z);
-    body.quaternion.set(slerpQuat.x, slerpQuat.y, slerpQuat.z, slerpQuat.w);
+      let targetPos, posT;
 
-    // Mirror to Three.js mesh immediately (syncCharacterToPhysics will
-    // confirm the same values later in the same frame)
-    mesh.position.copy(lerpPos);
-    mesh.quaternion.copy(slerpQuat);
+      if (tGetup < GATHER_FRAC) {
+        // Sub-phase 1a — gather scattered parts into a low crouch
+        targetPos = crouchPosAt(name, landX, landZ);
+        posT = easeInOutCubic(tGetup / GATHER_FRAC);
+      } else {
+        // Sub-phase 1b — rise smoothly from crouch to full standing height
+        const tt = (tGetup - GATHER_FRAC) / (1 - GATHER_FRAC);
+        posT = easeInOutCubic(tt);
+        // Lerp: crouch → standing  (start is crouchPos, not ragdoll pos)
+        const crouchP = crouchPosAt(name, landX, landZ);
+        const standP  = standingPosAt(name, landX, landZ);
+        targetPos = new THREE.Vector3().lerpVectors(crouchP, standP, posT);
+        // Override posT since we already computed the lerped position above
+        // — write it directly and return early.
+        slerpQ.slerpQuaternions(sp.quat, identQuat, quatProgress);
+        body.position.set(targetPos.x, targetPos.y, targetPos.z);
+        body.quaternion.set(slerpQ.x, slerpQ.y, slerpQ.z, slerpQ.w);
+        mesh.position.copy(targetPos);
+        mesh.quaternion.copy(slerpQ);
+        return;
+      }
+
+      // Sub-phase 1a path — generic lerp from ragdoll → crouch
+      const lerpPos = new THREE.Vector3().lerpVectors(sp.pos, targetPos, posT);
+      slerpQ.slerpQuaternions(sp.quat, identQuat, quatProgress);
+      body.position.set(lerpPos.x, lerpPos.y, lerpPos.z);
+      body.quaternion.set(slerpQ.x, slerpQ.y, slerpQ.z, slerpQ.w);
+      mesh.position.copy(lerpPos);
+      mesh.quaternion.copy(slerpQ);
+    });
+    return;
+  }
+
+  // ---- Phase 2: WALK BACK (elapsed GETUP_DURATION_MS → +WALK_DURATION_MS) -
+  const tWalk = Math.min((elapsed - GETUP_DURATION_MS) / WALK_DURATION_MS, 1);
+  const etWalk = easeInOutCubic(tWalk);
+
+  // Root x/z slides from landing spot to origin
+  const rootX = landX + (cx - landX) * etWalk;
+  const rootZ = landZ + (cz - landZ) * etWalk;
+
+  // Walking oscillation: step frequency tied to progress so the walk looks
+  // natural regardless of actual horizontal distance.
+  const phase   = tWalk * WALK_STEP_CYCLES * Math.PI * 2;
+  const bodyBob = Math.abs(Math.sin(phase)) * 0.03; // subtle up-bob on each step
+
+  // Show the walk hint exactly once when entering this phase
+  if (!returnAnimation.walkHintShown) {
+    returnAnimation.walkHintShown = true;
+    setHintText('Walking back… 👟');
+  }
+
+  char.parts.forEach(({ name, body, mesh }) => {
+    const sp = standingPosAt(name, rootX, rootZ);
+    if (!sp) return;
+
+    // Leg swing: left and right legs alternate; arms swing opposite
+    let dy = 0;
+    if (name === 'leftThigh'  || name === 'leftShin')    dy =  Math.sin(phase) * 0.08;
+    if (name === 'rightThigh' || name === 'rightShin')   dy = -Math.sin(phase) * 0.08;
+    if (name === 'leftUpperArm'  || name === 'leftForeArm')  dy = -Math.sin(phase) * 0.05;
+    if (name === 'rightUpperArm' || name === 'rightForeArm') dy =  Math.sin(phase) * 0.05;
+
+    // Keep shins above the floor
+    const finalY = Math.max(sp.y + dy + bodyBob, 0.05);
+    body.position.set(sp.x, finalY, sp.z);
+    body.quaternion.set(0, 0, 0, 1);
+    mesh.position.set(sp.x, finalY, sp.z);
+    mesh.quaternion.set(0, 0, 0, 1);
   });
 
-  if (t >= 1) {
+  if (tWalk >= 1) {
+    // Snap every part to the clean standing pose at the origin
+    char.parts.forEach(({ name, body, mesh }) => {
+      const sp = standingPosAt(name, cx, cz);
+      if (!sp) return;
+      body.position.set(sp.x, sp.y, sp.z);
+      body.quaternion.set(0, 0, 0, 1);
+      mesh.position.set(sp.x, sp.y, sp.z);
+      mesh.quaternion.set(0, 0, 0, 1);
+    });
     returnAnimation = null;
     gameState = STATE.READY;
     setHintText('🖱️ Drag to SLAP again!');
+  }
+}
+
+/**
+ * World-space standing pose position for the named body part, rooted at (rx, rz).
+ * Returns null for unknown part names.
+ *
+ * @param {string} name
+ * @param {number} rx - Root X coordinate.
+ * @param {number} rz - Root Z coordinate.
+ * @returns {THREE.Vector3|null}
+ */
+function standingPosAt(name, rx, rz) {
+  switch (name) {
+    case 'head':          return new THREE.Vector3(rx,        1.58,  rz);
+    case 'torso':         return new THREE.Vector3(rx,        1.025, rz);
+    case 'leftUpperArm':  return new THREE.Vector3(rx - 0.28, 1.11,  rz);
+    case 'rightUpperArm': return new THREE.Vector3(rx + 0.28, 1.11,  rz);
+    case 'leftForeArm':   return new THREE.Vector3(rx - 0.28, 0.85,  rz);
+    case 'rightForeArm':  return new THREE.Vector3(rx + 0.28, 0.85,  rz);
+    case 'leftThigh':     return new THREE.Vector3(rx - 0.12, 0.55,  rz);
+    case 'rightThigh':    return new THREE.Vector3(rx + 0.12, 0.55,  rz);
+    case 'leftShin':      return new THREE.Vector3(rx - 0.12, 0.175, rz);
+    case 'rightShin':     return new THREE.Vector3(rx + 0.12, 0.175, rz);
+    default:              return null;
+  }
+}
+
+/**
+ * World-space crouching pose position for the named body part, rooted at (rx, rz).
+ * All parts cluster close to the floor — used as the midpoint in the get-up sequence.
+ *
+ * @param {string} name
+ * @param {number} rx
+ * @param {number} rz
+ * @returns {THREE.Vector3|null}
+ */
+function crouchPosAt(name, rx, rz) {
+  switch (name) {
+    case 'head':          return new THREE.Vector3(rx,        0.72,  rz);
+    case 'torso':         return new THREE.Vector3(rx,        0.46,  rz);
+    case 'leftUpperArm':  return new THREE.Vector3(rx - 0.22, 0.44,  rz);
+    case 'rightUpperArm': return new THREE.Vector3(rx + 0.22, 0.44,  rz);
+    case 'leftForeArm':   return new THREE.Vector3(rx - 0.22, 0.30,  rz);
+    case 'rightForeArm':  return new THREE.Vector3(rx + 0.22, 0.30,  rz);
+    case 'leftThigh':     return new THREE.Vector3(rx - 0.12, 0.25,  rz);
+    case 'rightThigh':    return new THREE.Vector3(rx + 0.12, 0.25,  rz);
+    case 'leftShin':      return new THREE.Vector3(rx - 0.10, 0.07,  rz);
+    case 'rightShin':     return new THREE.Vector3(rx + 0.10, 0.07,  rz);
+    default:              return null;
   }
 }
 
