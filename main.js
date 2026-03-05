@@ -70,7 +70,11 @@ const ACCEPTED_IMAGE_EXTS = new Set([
  */
 const FACE_DETECT_INPUT_SIZES = [160, 224, 320, 416];
 
-/** Head Y position (metres) below which we consider the character "landed". */
+/** How long to pause (ms) after landing before the return animation starts. */
+const RETURN_PAUSE_MS = 1000;
+
+/** Duration (ms) of the smooth return-to-standing animation. */
+const RETURN_DURATION_MS = 1600;
 const LANDING_HEIGHT_THRESHOLD = 0.6;
 
 /** Speed (m/s) below which a landed character is considered at rest. */
@@ -90,10 +94,11 @@ const COMBOS = [
 
 /** Finite-state machine states for the game. */
 const STATE = {
-  INTRO:   'intro',    // start screen visible
-  LOADING: 'loading',  // face detection / model load in progress
-  READY:   'ready',    // character on screen, waiting for slap
-  FLYING:  'flying',   // character was slapped and is in the air / tumbling
+  INTRO:     'intro',      // start screen visible
+  LOADING:   'loading',    // face detection / model load in progress
+  READY:     'ready',      // character on screen, waiting for slap
+  FLYING:    'flying',     // character was slapped and is in the air / tumbling
+  RETURNING: 'returning',  // character is animating back to standing pose
 };
 let gameState = STATE.INTRO;
 
@@ -130,6 +135,10 @@ let swipeStart     = null;   // { x, y, time }
 // ---- Score ---------------------------------------------------
 let slapOrigin = new THREE.Vector3(); // world pos of head when slapped
 let maxFlyDist = 0;                   // maximum horizontal distance reached
+
+// ---- Return animation ----------------------------------------
+/** Tracks an in-progress "get back up and return" animation. */
+let returnAnimation = null;
 
 
 // ================================================================
@@ -349,34 +358,66 @@ function createCharacter(faceTex) {
 
   // ---- Materials -----------------------------------------------
   const skinMat  = new THREE.MeshStandardMaterial({ color: 0xffe0bd, roughness: 0.75 });
-  const shirtMat = new THREE.MeshStandardMaterial({ color: 0x2255dd, roughness: 0.6  });
-  const pantsMat = new THREE.MeshStandardMaterial({ color: 0x223300, roughness: 0.8  });
-  const shoeMat  = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9  });
-
-  // Face texture on the head sphere; fall back to skin colour
-  const headMat = faceTex
-    ? new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.7 })
-    : new THREE.MeshStandardMaterial({ color: 0xffe0bd, roughness: 0.7 });
+  const shirtMat = new THREE.MeshStandardMaterial({ color: 0xdd2277, roughness: 0.6  }); // rose-pink top
+  const pantsMat = skinMat;                                                               // bare legs
+  const shoeMat  = new THREE.MeshStandardMaterial({ color: 0x991122, roughness: 0.6  }); // red shoes
 
   const a = ANAT;
 
   // ---- HEAD ---------------------------------------------------
-  const { body: headBody } = makePart(
+  // The head sphere uses plain skin colour; the uploaded face is
+  // rendered as a flat decal plane attached to the front of the sphere
+  // so it always looks like a naturally-placed portrait.
+  const { mesh: headMesh, body: headBody } = makePart(
     'head',
     new THREE.SphereGeometry(a.head.r, 18, 18),
-    headMat,
+    skinMat,
     { x: cx, y: 1.58, z: cz },
     4
   );
 
+  // Face decal — a small plane sitting just in front of the sphere
+  let faceDecalMesh = null;
+  if (faceTex) {
+    // Scale to roughly fill the visible face area of the sphere (≈ 1.85 × radius)
+    const decalSize = a.head.r * 1.85;
+    faceDecalMesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(decalSize, decalSize),
+      new THREE.MeshStandardMaterial({
+        map: faceTex,
+        roughness: 0.65,
+        transparent: true,
+        alphaTest: 0.01,
+        depthWrite: false,
+      })
+    );
+    // Place the decal at the front (+Z = toward camera) of the sphere.
+    // 0.98 × radius sits just inside the surface to avoid z-fighting;
+    // the +0.001 m micro-offset gives an extra safety margin.
+    // The +0.015 m y-offset nudges the face slightly upward so the
+    // forehead is not clipped by the top of the sphere.
+    faceDecalMesh.position.set(0, 0.015, a.head.r * 0.98 + 0.001);
+    headMesh.add(faceDecalMesh);
+  }
+
   // ---- TORSO --------------------------------------------------
-  const { body: torsoBody } = makePart(
+  const { mesh: torsoMesh, body: torsoBody } = makePart(
     'torso',
     new THREE.BoxGeometry(a.torso.hw * 2, a.torso.hh * 2, a.torso.hd * 2),
     shirtMat,
     { x: cx, y: 1.025, z: cz },
     10
   );
+
+  // Decorative skirt — frustum cylinder attached to the torso so it
+  // tumbles with the body during ragdoll physics.
+  const skirtMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.19, 0.27, 0.38, 14),
+    new THREE.MeshStandardMaterial({ color: 0xcc44cc, roughness: 0.7 })
+  );
+  skirtMesh.position.set(0, -0.465, 0); // relative to torso centre
+  skirtMesh.castShadow = true;
+  torsoMesh.add(skirtMesh);
 
   // ---- LEFT UPPER ARM -----------------------------------------
   const { body: luaBody } = makePart(
@@ -461,6 +502,8 @@ function createCharacter(faceTex) {
   return {
     parts,
     neckMesh,
+    faceDecalMesh,
+    skirtMesh,
     constraints: [],
     headBody,
     torsoBody,
@@ -547,6 +590,18 @@ function destroyCharacter(char) {
   });
   scene.remove(char.neckMesh);
   char.neckMesh.geometry.dispose();
+  // faceDecalMesh is a child of headMesh; Three.js removes it from the
+  // scene automatically when headMesh is removed, but we still need to
+  // dispose its GPU resources.
+  if (char.faceDecalMesh) {
+    char.faceDecalMesh.geometry.dispose();
+    char.faceDecalMesh.material.dispose();
+  }
+  // skirtMesh is a child of torsoMesh and is removed with it.
+  if (char.skirtMesh) {
+    char.skirtMesh.geometry.dispose();
+    char.skirtMesh.material.dispose();
+  }
 }
 
 /**
@@ -576,6 +631,9 @@ function syncCharacterToPhysics(char) {
  */
 function resetCharacterPose(char) {
   if (!char) return;
+
+  // Cancel any in-progress return animation
+  returnAnimation = null;
 
   // Remove constraints from physics world
   char.constraints.forEach(c => physicsWorld.removeConstraint(c));
@@ -821,9 +879,10 @@ function tickScore() {
 
 /** Trigger the end-of-slap UI after the character comes to rest. */
 function onCharacterLanded() {
-  gameState = STATE.READY;
+  gameState = STATE.RETURNING;
   showCombo(maxFlyDist);
-  setHintText('🖱️ Drag to SLAP again!');
+  setHintText('Getting back up… 🧍‍♀️');
+  beginReturnAnimation(character);
 }
 
 /** Pick and display a combo message based on distance flown. */
@@ -847,6 +906,113 @@ function showCombo(dist) {
 
 function setDistanceDisplay(d) {
   document.getElementById('dist-value').textContent = d.toFixed(1) + ' m';
+}
+
+
+// ================================================================
+// 7b. RETURN ANIMATION — character gets back up and walks to origin
+// ================================================================
+
+/** Cubic ease-in-out: smooth start and end for the return glide. */
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+/**
+ * Freeze physics, snapshot current poses, and schedule the smooth
+ * return-to-standing animation.
+ *
+ * @param {object} char - The active character object.
+ */
+function beginReturnAnimation(char) {
+  if (!char) return;
+
+  // Disable all physics — stop ragdoll motion immediately
+  char.constraints.forEach(c => physicsWorld.removeConstraint(c));
+  char.constraints = [];
+  char.isPhysicsOn = false;
+
+  char.parts.forEach(({ body }) => {
+    body.velocity.set(0, 0, 0);
+    body.angularVelocity.set(0, 0, 0);
+    body.mass = 0;
+    body.updateMassProperties();
+    body.type = CANNON.Body.STATIC;
+  });
+
+  // Snapshot current world-space pose of every part
+  const startPoses = {};
+  char.parts.forEach(({ name, body }) => {
+    startPoses[name] = {
+      pos:  new THREE.Vector3(body.position.x,    body.position.y,    body.position.z),
+      quat: new THREE.Quaternion(body.quaternion.x, body.quaternion.y,
+                                 body.quaternion.z, body.quaternion.w),
+    };
+  });
+
+  returnAnimation = {
+    startTime:  performance.now() + RETURN_PAUSE_MS,
+    duration:   RETURN_DURATION_MS,
+    startPoses,
+    char,
+  };
+}
+
+/**
+ * Called every frame: smoothly interpolates each ragdoll part from its
+ * post-slap position back to the standing pose, then transitions to READY.
+ */
+function tickReturn() {
+  if (gameState !== STATE.RETURNING || !returnAnimation) return;
+
+  const now     = performance.now();
+  if (now < returnAnimation.startTime) return; // still in the initial pause
+
+  const elapsed = now - returnAnimation.startTime;
+  const t       = Math.min(elapsed / returnAnimation.duration, 1);
+  const et      = easeInOutCubic(t);
+
+  const { cx, cz } = ANAT;
+  const targetPoses = {
+    head:          new THREE.Vector3(cx,        1.58,  cz),
+    torso:         new THREE.Vector3(cx,        1.025, cz),
+    leftUpperArm:  new THREE.Vector3(cx - 0.28, 1.11,  cz),
+    rightUpperArm: new THREE.Vector3(cx + 0.28, 1.11,  cz),
+    leftForeArm:   new THREE.Vector3(cx - 0.28, 0.85,  cz),
+    rightForeArm:  new THREE.Vector3(cx + 0.28, 0.85,  cz),
+    leftThigh:     new THREE.Vector3(cx - 0.12, 0.55,  cz),
+    rightThigh:    new THREE.Vector3(cx + 0.12, 0.55,  cz),
+    leftShin:      new THREE.Vector3(cx - 0.12, 0.175, cz),
+    rightShin:     new THREE.Vector3(cx + 0.12, 0.175, cz),
+  };
+
+  const identQuat = new THREE.Quaternion();
+  const lerpPos   = new THREE.Vector3();
+  const slerpQuat = new THREE.Quaternion();
+
+  returnAnimation.char.parts.forEach(({ name, body, mesh }) => {
+    const sp = returnAnimation.startPoses[name];
+    const tp = targetPoses[name];
+    if (!sp || !tp) return;
+
+    lerpPos.lerpVectors(sp.pos, tp, et);
+    slerpQuat.slerpQuaternions(sp.quat, identQuat, et);
+
+    // Move the Cannon body (STATIC — physics won't fight us)
+    body.position.set(lerpPos.x, lerpPos.y, lerpPos.z);
+    body.quaternion.set(slerpQuat.x, slerpQuat.y, slerpQuat.z, slerpQuat.w);
+
+    // Mirror to Three.js mesh immediately (syncCharacterToPhysics will
+    // confirm the same values later in the same frame)
+    mesh.position.copy(lerpPos);
+    mesh.quaternion.copy(slerpQuat);
+  });
+
+  if (t >= 1) {
+    returnAnimation = null;
+    gameState = STATE.READY;
+    setHintText('🖱️ Drag to SLAP again!');
+  }
 }
 
 
@@ -896,6 +1062,9 @@ function animate(timestamp) {
     physicsWorld.step(FIXED_DT, elapsed, MAX_STEPS);
   }
   lastTimestamp = timestamp;
+
+  // Drive the return-to-standing animation (must run before sync)
+  tickReturn();
 
   // Sync Three.js meshes to physics state
   syncCharacterToPhysics(character);
@@ -1028,6 +1197,7 @@ function setupEvents() {
   // Restart button — keep current face, reset ragdoll pose
   document.getElementById('restart-btn').addEventListener('click', () => {
     if (!character) return;
+    if (gameState !== STATE.READY && gameState !== STATE.FLYING && gameState !== STATE.RETURNING) return;
     resetCharacterPose(character);
     setDistanceDisplay(0);
     maxFlyDist = 0;
