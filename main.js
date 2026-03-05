@@ -24,8 +24,15 @@
 // 1.  CONSTANTS & GLOBAL STATE
 // ================================================================
 
-/** URL prefix for face-api.js model weights (served from npm CDN). */
-const MODELS_URL = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights';
+/**
+ * Primary URL prefix for face-api.js model weights.
+ * We serve them from the repo's own `models/` folder so the game works
+ * without any external network request (fixes "Failed to fetch" errors).
+ */
+const MODELS_URL = './models';
+
+/** CDN fallback URL used when the local models/ folder is unreachable. */
+const MODELS_URL_CDN = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights';
 
 /** Physics gravity (m/s² — exaggerated for fun). */
 const GRAVITY = -22;
@@ -619,7 +626,14 @@ function resetCharacterPose(char) {
 
 /** Load the lightweight TinyFaceDetector model weights. */
 async function loadFaceModels() {
-  await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL);
+  // Try the locally-bundled weights first (no network needed).
+  // Fall back to the CDN only if the local load fails (e.g. running from
+  // a file:// URL where relative paths resolve differently).
+  try {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL);
+  } catch (_err) {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODELS_URL_CDN);
+  }
 }
 
 /**
@@ -971,8 +985,16 @@ async function handleImageUpload(file) {
 
   } catch (err) {
     console.error('[SlapSim] Image processing error:', err);
-    setLoadingText('Oops! ' + err.message + ' — Please try again.');
-    await sleep(2500);
+    // Translate low-level network errors into plain English
+    const errMsg = (err.message || '').toLowerCase();
+    const isNetworkErr = errMsg.includes('failed to fetch') ||
+                         errMsg.includes('networkerror') ||
+                         errMsg.includes('load failed');
+    const msg = isNetworkErr
+      ? 'Could not load face-detection models (network error). Check your connection and try again.'
+      : 'Oops! ' + err.message + ' — Please try again.';
+    setLoadingText(msg);
+    await sleep(3000);
     showScreen('start');
     gameState = STATE.INTRO;
   }
