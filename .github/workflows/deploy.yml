@@ -1,0 +1,63 @@
+# ================================================================
+# GitHub Pages deployment workflow for Slap Simulator
+#
+# Triggers on every push to the main (or master) branch.
+# Uses the official GitHub Pages actions to publish the static
+# game files (index.html / style.css / main.js) with zero build step.
+#
+# To enable GitHub Pages in your repository:
+#   Settings → Pages → Source → "GitHub Actions"
+# ================================================================
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  # Allow manual re-deployment from the Actions tab
+  workflow_dispatch:
+
+# Grant the workflow permission to write to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment runs at a time; skip queued runs but never
+# cancel a run that is already in progress.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      # 1. Check out the repository
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Configure GitHub Pages (generates the _site artifact settings)
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      # 3. Upload the entire repo root as the Pages artifact.
+      #    Only the static files (index.html, style.css, main.js) are
+      #    needed; hidden directories (.git, .github) are excluded
+      #    automatically by the upload-pages-artifact action.
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      # 4. Deploy the uploaded artifact to GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
