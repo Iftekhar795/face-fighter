@@ -7,6 +7,52 @@ Upload a photo → the game detects the face and pastes it on a ragdoll dummy �
 
 ---
 
+## 🏁 Getting Started
+
+There are three ways to get the game running, from quickest to most hands-on:
+
+### Option 1 — Play it live (GitHub Pages)
+
+If GitHub Pages is already enabled for this repo, just open the link below in any browser:
+
+```
+https://Iftekhar795.github.io/face-fighter/
+```
+
+> **First time?** Enable GitHub Pages in your own fork:  
+> **Settings → Pages → Source → "GitHub Actions"**  
+> The included workflow (`.github/workflows/deploy.yml`) will publish the game automatically on every push to `main`.
+
+### Option 2 — Run locally with one command
+
+No installation required. Open a terminal inside the cloned folder and run:
+
+```bash
+# Clone (skip if you already have it)
+git clone https://github.com/Iftekhar795/face-fighter.git
+cd face-fighter
+
+# Serve with Python 3 (built into macOS / Linux / most Windows installs)
+python3 -m http.server 8080
+```
+
+Then open **http://localhost:8080** in your browser.
+
+> **Windows without Python?** Use [Node.js](https://nodejs.org) instead:
+> ```bash
+> npx serve .
+> ```
+> and open the URL it prints.
+
+### Option 3 — VS Code Live Server (recommended for development)
+
+1. Install the [Live Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer) extension.
+2. Open the `face-fighter` folder in VS Code.
+3. Right-click `index.html` → **Open with Live Server**.
+4. The game opens in your default browser with auto-reload on save.
+
+---
+
 ## 🎮 How to Play
 
 1. Open the live link (see *Deploy* below).
@@ -34,29 +80,17 @@ Upload a photo → the game detects the face and pastes it on a ragdoll dummy �
 
 The repository includes a GitHub Actions workflow that publishes the game automatically.
 
-### One-time setup (new repo)
+### One-time setup
 
 1. Push the code to a GitHub repository.
 2. Go to **Settings → Pages → Source** and choose **"GitHub Actions"**.
-3. Push (or re-run the workflow) — the game will be live at:
+3. Push (or re-run the workflow from the **Actions** tab) — the game will be live at:
 
 ```
 https://<your-username>.github.io/<repo-name>/
 ```
 
 The workflow file is at `.github/workflows/deploy.yml` and runs on every push to `main` / `master`.
-
-### Run locally
-
-No build tools required — just serve the files over HTTP:
-
-```bash
-# Python 3
-python3 -m http.server 8080
-# then open http://localhost:8080
-```
-
-Or use any static-file server (VS Code Live Server, npx serve, etc.).
 
 ---
 
