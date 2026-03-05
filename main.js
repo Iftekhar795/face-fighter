@@ -34,27 +34,27 @@ const MODELS_URL = './models';
 /** CDN fallback URL used when the local models/ folder is unreachable. */
 const MODELS_URL_CDN = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights';
 
-/** Physics gravity (m/s² — exaggerated for fun). */
-const GRAVITY = -22;
+/** Physics gravity (m/s² — exaggerated for fun but kept mild so the character stays airborne longer). */
+const GRAVITY = -14;
 
-/** Room half-size in metres. */
-const ROOM_HALF = 10;
+/** Room half-size in metres — large enough for epic long-distance launches. */
+const ROOM_HALF = 70;
 
 /** Maximum impulse force that can be applied by one slap. */
-const MAX_FORCE = 120;
+const MAX_FORCE = 520;
 
 /**
  * Tiny baseline force so that even a barely-qualifying swipe still does
  * something visible.  Kept low so swipe speed is the dominant factor.
  */
-const BASE_FORCE = 4;
+const BASE_FORCE = 5;
 
 /**
  * How many Newtons per px/s of swipe speed.
- * With this value a ~1 800 px/s swipe reaches MAX_FORCE.
- * A slow 200 px/s swipe produces only ~16 N — a light push.
+ * With this value a ~2 340 px/s swipe reaches MAX_FORCE.
+ * A slow 200 px/s swipe produces only ~49 N — a feeble push.
  */
-const FORCE_SPEED_MULTIPLIER = 0.065;
+const FORCE_SPEED_MULTIPLIER = 0.22;
 
 /** Fraction of head-bounding-box used as padding when cropping the face. */
 const FACE_CROP_PADDING_RATIO = 0.38;
@@ -80,6 +80,11 @@ const FACE_DETECT_INPUT_SIZES = [160, 224, 320, 416];
 /** How long to pause (ms) after landing before the return animation starts. */
 const RETURN_PAUSE_MS = 300;
 
+/** Detection margin (m) around each building AABB for collision triggering.
+ *  Large enough that crumble fires before the character physically hits the wall
+ *  even at maximum launch speed. */
+const BUILDING_COLLISION_MARGIN = 2.8;
+
 /** Duration (ms) of the fast get-up phase (gather into crouch → rise to stand). */
 const GETUP_DURATION_MS = 650;
 
@@ -101,11 +106,12 @@ const LANDING_SPEED_THRESHOLD = 0.8;
  * Each entry requires the character to have flown at least `min` metres.
  */
 const COMBOS = [
-  { min: 0,  text: 'LIGHT TAP 😴',          color: '#aaaaaa' },
-  { min: 2,  text: 'NICE SLAP! 👋',          color: '#ffde00' },
-  { min: 5,  text: 'SUPER COMBO! 🔥',        color: '#ff8c00' },
-  { min: 10, text: 'CRITICAL SLAP! 💥',      color: '#ff4444' },
-  { min: 20, text: 'EMOTIONAL DAMAGE! 😭💢', color: '#ff00ff' },
+  { min: 0,   text: 'LIGHT TAP 😴',             color: '#aaaaaa' },
+  { min: 3,   text: 'NICE SLAP! 👋',            color: '#ffde00' },
+  { min: 10,  text: 'SUPER COMBO! 🔥',          color: '#ff8c00' },
+  { min: 22,  text: 'CRITICAL SLAP! 💥',        color: '#ff4444' },
+  { min: 40,  text: 'EMOTIONAL DAMAGE! 😭💢',   color: '#ff00ff' },
+  { min: 65,  text: 'CITY DESTROYER! 🏙️💥',     color: '#00ffff' },
 ];
 
 /** Finite-state machine states for the game. */
@@ -156,6 +162,15 @@ let maxFlyDist = 0;                   // maximum horizontal distance reached
 /** Tracks an in-progress "get back up and return" animation. */
 let returnAnimation = null;
 
+// ---- Buildings -----------------------------------------------
+/** Array of destructible building objects created by initBuildings(). */
+let buildings = [];
+
+// ---- Camera follow -------------------------------------------
+/** Default camera world position and look-at target. */
+const CAM_DEFAULT_POS  = new THREE.Vector3(0, 1.6, 4.0);
+const CAM_DEFAULT_LOOK = new THREE.Vector3(0, 1.1, 0);
+
 
 // ================================================================
 // 2.  THREE.JS — RENDERER, SCENE, LIGHTS, ROOM
@@ -165,14 +180,14 @@ let returnAnimation = null;
 function initRenderer() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0d0d1a);
-  scene.fog = new THREE.FogExp2(0x0d0d1a, 0.035);
+  scene.fog = new THREE.FogExp2(0x0d0d1a, 0.005);
 
   // Perspective camera positioned in front of the character
   camera = new THREE.PerspectiveCamera(
     65,
     window.innerWidth / window.innerHeight,
     0.1,
-    60
+    320
   );
   camera.position.set(0, 1.6, 4.0);
   camera.lookAt(0, 1.1, 0);
@@ -218,6 +233,15 @@ function initLights() {
   const fill = new THREE.PointLight(0xff4400, 0.65, 14);
   fill.position.set(0, 3, 3.5);
   scene.add(fill);
+
+  // Blue city-glow lights near the distant buildings
+  const cityGlow1 = new THREE.PointLight(0x2255cc, 0.7, 40);
+  cityGlow1.position.set(0, 6, -18);
+  scene.add(cityGlow1);
+
+  const cityGlow2 = new THREE.PointLight(0x112244, 0.5, 60);
+  cityGlow2.position.set(0, 10, -40);
+  scene.add(cityGlow2);
 }
 
 /** Build the room: floor, grid overlay, and box-shaped walls/ceiling. */
@@ -229,8 +253,8 @@ function initRoom() {
   floor.receiveShadow = true;
   scene.add(floor);
 
-  // Subtle grid for depth cue
-  const grid = new THREE.GridHelper(ROOM_HALF * 2, ROOM_HALF * 2, 0x333355, 0x222244);
+  // Subtle grid for depth cue (70 divisions → 2 m cells at the new room scale)
+  const grid = new THREE.GridHelper(ROOM_HALF * 2, 70, 0x333355, 0x222244);
   grid.position.y = 0.003;
   scene.add(grid);
 
@@ -247,6 +271,24 @@ function initRoom() {
   room.position.set(0, 6, 0);
   room.receiveShadow = true;
   scene.add(room);
+
+  // Distant skyline silhouettes — purely decorative background objects,
+  // no physics bodies, placed just inside the far wall.
+  const skylineZ   = -ROOM_HALF + 4;
+  const skylineMat = new THREE.MeshStandardMaterial({ color: 0x0a0f1c, roughness: 1 });
+  [
+    { x: -28, w: 10, h: 32 }, { x: -16, w: 15, h: 42 },
+    { x:   2, w:  8, h: 26 }, { x:  12, w: 12, h: 36 },
+    { x:  25, w:  9, h: 29 },
+  ].forEach(s => {
+    const m = new THREE.Mesh(
+      new THREE.BoxGeometry(s.w, s.h, 4),
+      skylineMat
+    );
+    m.position.set(s.x, s.h / 2, skylineZ);
+    m.receiveShadow = true;
+    scene.add(m);
+  });
 }
 
 
@@ -342,15 +384,17 @@ function createCharacter(faceTex) {
   const { cx, cz } = ANAT;
 
   // ---- Helper: create one body+mesh pair -----------------------
-  function makePart(name, geo, mat, pos, mass) {
+  function makePart(name, geo, mat, pos, mass, cannonShape) {
     const mesh = new THREE.Mesh(geo, mat);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
 
-    // Determine Cannon shape from Three geometry type
+    // Use explicit Cannon shape if provided; otherwise derive from geometry type.
     let shape;
-    if (geo.type === 'SphereGeometry' || geo.type === 'SphereBufferGeometry') {
+    if (cannonShape) {
+      shape = cannonShape;
+    } else if (geo.type === 'SphereGeometry' || geo.type === 'SphereBufferGeometry') {
       shape = new CANNON.Sphere(ANAT.head.r);
     } else if (geo.type === 'BoxGeometry' || geo.type === 'BoxBufferGeometry') {
       const p = geo.parameters;
@@ -373,10 +417,10 @@ function createCharacter(faceTex) {
   }
 
   // ---- Materials -----------------------------------------------
-  const skinMat  = new THREE.MeshStandardMaterial({ color: 0xffe0bd, roughness: 0.75 });
-  const shirtMat = new THREE.MeshStandardMaterial({ color: 0xdd2277, roughness: 0.6  }); // rose-pink top
-  const pantsMat = skinMat;                                                               // bare legs
-  const shoeMat  = new THREE.MeshStandardMaterial({ color: 0x991122, roughness: 0.6  }); // red shoes
+  const skinMat  = new THREE.MeshStandardMaterial({ color: 0xf5c5a3, roughness: 0.70, metalness: 0.0 });
+  const shirtMat = new THREE.MeshStandardMaterial({ color: 0xdd2277, roughness: 0.55, metalness: 0.0 }); // rose-pink top
+  const pantsMat = skinMat;                                                                               // same skin tone (bare legs)
+  const shoeMat  = new THREE.MeshStandardMaterial({ color: 0x880011, roughness: 0.55, metalness: 0.1 }); // red shoes
 
   const a = ANAT;
 
@@ -416,6 +460,16 @@ function createCharacter(faceTex) {
     headMesh.add(faceDecalMesh);
   }
 
+  // Hair — dark partial hemisphere sitting on top of the head sphere.
+  // It's a child of headMesh so it tumbles with the ragdoll head.
+  const hairMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(a.head.r * 1.05, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55),
+    new THREE.MeshStandardMaterial({ color: 0x1a0a00, roughness: 0.92 })
+  );
+  hairMesh.position.set(0, a.head.r * 0.12, 0);
+  hairMesh.castShadow = true;
+  headMesh.add(hairMesh);
+
   // ---- TORSO --------------------------------------------------
   const { mesh: torsoMesh, body: torsoBody } = makePart(
     'torso',
@@ -436,75 +490,84 @@ function createCharacter(faceTex) {
   torsoMesh.add(skirtMesh);
 
   // ---- LEFT UPPER ARM -----------------------------------------
+  // CylinderGeometry for rounded visual; CANNON.Box keeps physics joints intact.
   const { body: luaBody } = makePart(
     'leftUpperArm',
-    new THREE.BoxGeometry(a.upperArm.hw * 2, a.upperArm.hh * 2, a.upperArm.hd * 2),
+    new THREE.CylinderGeometry(a.upperArm.hd * 0.95, a.upperArm.hd * 0.85, a.upperArm.hh * 2, 10),
     shirtMat,
     { x: cx - 0.28, y: 1.11, z: cz },
-    2
+    2,
+    new CANNON.Box(new CANNON.Vec3(a.upperArm.hw, a.upperArm.hh, a.upperArm.hd))
   );
 
   // ---- RIGHT UPPER ARM ----------------------------------------
   const { body: ruaBody } = makePart(
     'rightUpperArm',
-    new THREE.BoxGeometry(a.upperArm.hw * 2, a.upperArm.hh * 2, a.upperArm.hd * 2),
+    new THREE.CylinderGeometry(a.upperArm.hd * 0.95, a.upperArm.hd * 0.85, a.upperArm.hh * 2, 10),
     shirtMat,
     { x: cx + 0.28, y: 1.11, z: cz },
-    2
+    2,
+    new CANNON.Box(new CANNON.Vec3(a.upperArm.hw, a.upperArm.hh, a.upperArm.hd))
   );
 
   // ---- LEFT FOREARM -------------------------------------------
   const { body: lfaBody } = makePart(
     'leftForeArm',
-    new THREE.BoxGeometry(a.foreArm.hw * 2, a.foreArm.hh * 2, a.foreArm.hd * 2),
+    new THREE.CylinderGeometry(a.foreArm.hd * 0.90, a.foreArm.hd * 0.80, a.foreArm.hh * 2, 10),
     skinMat,
     { x: cx - 0.28, y: 0.85, z: cz },
-    1.5
+    1.5,
+    new CANNON.Box(new CANNON.Vec3(a.foreArm.hw, a.foreArm.hh, a.foreArm.hd))
   );
 
   // ---- RIGHT FOREARM ------------------------------------------
   const { body: rfaBody } = makePart(
     'rightForeArm',
-    new THREE.BoxGeometry(a.foreArm.hw * 2, a.foreArm.hh * 2, a.foreArm.hd * 2),
+    new THREE.CylinderGeometry(a.foreArm.hd * 0.90, a.foreArm.hd * 0.80, a.foreArm.hh * 2, 10),
     skinMat,
     { x: cx + 0.28, y: 0.85, z: cz },
-    1.5
+    1.5,
+    new CANNON.Box(new CANNON.Vec3(a.foreArm.hw, a.foreArm.hh, a.foreArm.hd))
   );
 
   // ---- LEFT THIGH ---------------------------------------------
   const { body: lthBody } = makePart(
     'leftThigh',
-    new THREE.BoxGeometry(a.thigh.hw * 2, a.thigh.hh * 2, a.thigh.hd * 2),
+    new THREE.CylinderGeometry(a.thigh.hd * 1.05, a.thigh.hd * 0.92, a.thigh.hh * 2, 10),
     pantsMat,
     { x: cx - 0.12, y: 0.55, z: cz },
-    4
+    4,
+    new CANNON.Box(new CANNON.Vec3(a.thigh.hw, a.thigh.hh, a.thigh.hd))
   );
 
   // ---- RIGHT THIGH --------------------------------------------
   const { body: rthBody } = makePart(
     'rightThigh',
-    new THREE.BoxGeometry(a.thigh.hw * 2, a.thigh.hh * 2, a.thigh.hd * 2),
+    new THREE.CylinderGeometry(a.thigh.hd * 1.05, a.thigh.hd * 0.92, a.thigh.hh * 2, 10),
     pantsMat,
     { x: cx + 0.12, y: 0.55, z: cz },
-    4
+    4,
+    new CANNON.Box(new CANNON.Vec3(a.thigh.hw, a.thigh.hh, a.thigh.hd))
   );
 
   // ---- LEFT SHIN ----------------------------------------------
   const { body: lshBody } = makePart(
     'leftShin',
-    new THREE.BoxGeometry(a.shin.hw * 2, a.shin.hh * 2, a.shin.hd * 2),
+    new THREE.CylinderGeometry(a.shin.hd * 0.90, a.shin.hd * 0.80, a.shin.hh * 2, 10),
     shoeMat,
     { x: cx - 0.12, y: 0.175, z: cz },
-    3
+    3,
+    new CANNON.Box(new CANNON.Vec3(a.shin.hw, a.shin.hh, a.shin.hd))
   );
 
   // ---- RIGHT SHIN ---------------------------------------------
   const { body: rshBody } = makePart(
     'rightShin',
-    new THREE.BoxGeometry(a.shin.hw * 2, a.shin.hh * 2, a.shin.hd * 2),
+    new THREE.CylinderGeometry(a.shin.hd * 0.90, a.shin.hd * 0.80, a.shin.hh * 2, 10),
     shoeMat,
     { x: cx + 0.12, y: 0.175, z: cz },
-    3
+    3,
+    new CANNON.Box(new CANNON.Vec3(a.shin.hw, a.shin.hh, a.shin.hd))
   );
 
   // ---- NECK (visual connector mesh, no physics body) ----------
@@ -849,19 +912,19 @@ function applySlap(dirX, dirY, force) {
   gameState  = STATE.FLYING;
   setHintText('');
 
-  // Impulse on head: horizontal swipe + upward toss + push away from camera
+  // Impulse on head: horizontal swipe + upward toss + strong push away from camera
   const impulse = new CANNON.Vec3(
     dirX * force,
-    Math.abs(dirY) * force * 0.6 + force * 0.35, // always some upward force
-    -force * 0.45                                 // always push away from camera
+    Math.abs(dirY) * force * 0.55 + force * 0.30, // always some upward force
+    -force * 1.1                                   // strong push deep into the scene
   );
   character.headBody.applyImpulse(impulse, character.headBody.position);
 
   // Lighter impulse on the torso so the whole body follows
   const bodyImpulse = new CANNON.Vec3(
     dirX * force * 0.45,
-    force * 0.15,
-    -force * 0.2
+    force * 0.12,
+    -force * 0.55
   );
   character.torsoBody.applyImpulse(bodyImpulse, character.torsoBody.position);
 }
@@ -890,7 +953,11 @@ function tickScore() {
   const speed = Math.hypot(vel.x, vel.y, vel.z);
   if (hp.y < LANDING_HEIGHT_THRESHOLD && speed < LANDING_SPEED_THRESHOLD && maxFlyDist > 0) {
     onCharacterLanded();
+    return;
   }
+
+  // Check for building collisions while airborne
+  checkBuildingCollisions();
 }
 
 /** Trigger the end-of-slap UI after the character comes to rest. */
@@ -1150,7 +1217,217 @@ function crouchPosAt(name, rx, rz) {
 
 
 // ================================================================
-// 8.  UI HELPERS
+// 7c.  DESTRUCTIBLE BUILDINGS
+// ================================================================
+
+/**
+ * Specifications for each building in the scene.
+ * x/z = centre position (world), w/h/d = width/height/depth,
+ * floors = number of independently-physics floor slabs,
+ * color = hex integer for the concrete material.
+ */
+const BUILDING_SPECS = [
+  { x:  0,    z: -12,  w: 4.5, h: 10, d: 3.5, floors: 4, color: 0x5a6a7a },
+  { x: -6.5,  z: -21,  w: 3.5, h: 13, d: 3.0, floors: 5, color: 0x4a5f70 },
+  { x:  5.5,  z: -21,  w: 3.0, h:  9, d: 2.5, floors: 3, color: 0x607080 },
+  { x:  0.5,  z: -36,  w: 6.0, h: 18, d: 4.0, floors: 6, color: 0x3a4a5a },
+  { x: -5.0,  z: -54,  w: 5.0, h: 22, d: 4.0, floors: 8, color: 0x2a3a4a },
+  { x:  6.0,  z: -54,  w: 4.0, h: 16, d: 3.5, floors: 6, color: 0x354555 },
+];
+
+/**
+ * Spawn all destructible buildings.
+ * Destroys any previously existing buildings first.
+ */
+function initBuildings() {
+  destroyBuildings();
+
+  for (const spec of BUILDING_SPECS) {
+    const building = { bodies: [], meshes: [], broken: false, spec };
+    const floorH = spec.h / spec.floors;
+
+    for (let i = 0; i < spec.floors; i++) {
+      const y = floorH / 2 + i * floorH;
+
+      // --- Visual mesh: concrete slab -------------------------
+      const slabMat = new THREE.MeshStandardMaterial({
+        color:     spec.color,
+        roughness: 0.85,
+        metalness: 0.05,
+      });
+      const slab = new THREE.Mesh(
+        new THREE.BoxGeometry(spec.w, floorH * 0.92, spec.d),
+        slabMat
+      );
+      slab.position.set(spec.x, y, spec.z);
+      slab.castShadow    = true;
+      slab.receiveShadow = true;
+      scene.add(slab);
+      building.meshes.push(slab);
+
+      // --- Window panel: child of slab (follows tumble) ------
+      const winMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(spec.w * 0.78, floorH * 0.52, 0.06),
+        new THREE.MeshStandardMaterial({
+          color:            0x223344,
+          emissive:         0x334466,
+          emissiveIntensity: Math.random() * 0.45 + 0.08,
+          roughness:        0.3,
+          metalness:        0.5,
+        })
+      );
+      // Place on the +Z (camera-facing) face of the slab
+      winMesh.position.set(0, 0, spec.d / 2 + 0.04);
+      slab.add(winMesh);
+
+      // --- Physics body (STATIC until struck) ----------------
+      const body = new CANNON.Body({ mass: 0 });
+      body.addShape(new CANNON.Box(
+        new CANNON.Vec3(spec.w / 2, floorH / 2, spec.d / 2)
+      ));
+      body.position.set(spec.x, y, spec.z);
+      body.type       = CANNON.Body.STATIC;
+      body.allowSleep = false;
+      physicsWorld.addBody(body);
+      building.bodies.push(body);
+    }
+
+    buildings.push(building);
+  }
+}
+
+/**
+ * Make a building crumble: switch all its floor bodies to DYNAMIC and
+ * kick them outward so they tumble realistically.
+ *
+ * @param {object} building  - Entry from the `buildings` array.
+ * @param {number} impactY   - World-Y of impact (upper floors get more scatter).
+ */
+function crumbleBuilding(building, impactY) {
+  if (building.broken) return;
+  building.broken = true;
+
+  const floorH = building.spec.h / building.spec.floors;
+
+  building.bodies.forEach((body, i) => {
+    const floorY    = floorH / 2 + i * floorH;
+    const isAbove   = floorY > (impactY || 0);
+    const scatter   = isAbove ? 2.2 : 0.8;
+
+    body.mass = 60 + i * 25;
+    body.updateMassProperties();
+    body.type = CANNON.Body.DYNAMIC;
+    body.wakeUp();
+
+    body.applyImpulse(
+      new CANNON.Vec3(
+        (Math.random() - 0.5) * scatter * 12,
+        isAbove ? Math.random() * 8 + 3 : Math.random() * 3,
+        (Math.random() - 0.5) * scatter * 8
+      ),
+      new CANNON.Vec3(
+        body.position.x + (Math.random() - 0.5) * 0.6,
+        body.position.y,
+        body.position.z + (Math.random() - 0.5) * 0.6
+      )
+    );
+  });
+
+  // Flash the combo display
+  const el = document.getElementById('combo-text');
+  el.textContent      = '🏗️ BUILDING DESTROYED! 💥';
+  el.style.color      = '#ff8800';
+  el.style.textShadow = '0 0 18px #ff8800, 3px 3px 0 #000';
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+/**
+ * Proximity-based building-collision check.
+ * Called every frame while the character is FLYING.
+ * Triggers crumble when the character's head enters a building's AABB
+ * (with a generous 2.8 m detection margin to beat the physics at high speed).
+ */
+function checkBuildingCollisions() {
+  if (!character) return;
+  const hp = character.headBody.position;
+
+  for (const building of buildings) {
+    if (building.broken) continue;
+    const { spec } = building;
+    const dx = Math.abs(hp.x - spec.x) - spec.w * 0.5;
+    const dz = Math.abs(hp.z - spec.z) - spec.d * 0.5;
+    if (dx < BUILDING_COLLISION_MARGIN && dz < BUILDING_COLLISION_MARGIN &&
+        hp.y > -0.5 && hp.y < spec.h + BUILDING_COLLISION_MARGIN) {
+      crumbleBuilding(building, hp.y);
+      return; // one building per frame is enough
+    }
+  }
+}
+
+/**
+ * Each frame: sync crumbling floor-slab meshes to their now-dynamic bodies.
+ * Window panels are children of the slab mesh and follow automatically.
+ */
+function tickBuildings() {
+  for (const building of buildings) {
+    if (!building.broken) continue;
+    building.bodies.forEach((body, i) => {
+      const mesh = building.meshes[i];
+      mesh.position.copy(body.position);
+      mesh.quaternion.copy(body.quaternion);
+    });
+  }
+}
+
+/**
+ * Remove all building meshes from the scene and bodies from physics world.
+ */
+function destroyBuildings() {
+  for (const building of buildings) {
+    building.bodies.forEach(body => physicsWorld.removeBody(body));
+    building.meshes.forEach(mesh => {
+      scene.remove(mesh);
+      mesh.geometry.dispose();
+      mesh.material.dispose();
+    });
+  }
+  buildings = [];
+}
+
+
+// ================================================================
+// 7d.  CAMERA FOLLOW
+// ================================================================
+
+/**
+ * Smoothly track the flying character; return to the default position
+ * once the character lands and walks back.
+ */
+function tickCamera() {
+  if (!character) return;
+  const hp = character.headBody.position;
+
+  if (gameState === STATE.FLYING) {
+    // Stay 8 m behind character in Z, follow X and Y gently
+    const tgtX = hp.x * 0.45;
+    const tgtY = Math.max(1.6, hp.y * 0.35 + 1.8);
+    const tgtZ = Math.min(4.0, hp.z + 8);   // never move in front of start
+
+    camera.position.x += (tgtX - camera.position.x) * 0.06;
+    camera.position.y += (tgtY - camera.position.y) * 0.06;
+    camera.position.z += (tgtZ - camera.position.z) * 0.06;
+    camera.lookAt(hp.x, Math.max(0.3, hp.y * 0.7), hp.z);
+
+  } else if (gameState === STATE.RETURNING || gameState === STATE.READY) {
+    // Glide back to default
+    camera.position.x += (CAM_DEFAULT_POS.x - camera.position.x) * 0.05;
+    camera.position.y += (CAM_DEFAULT_POS.y - camera.position.y) * 0.05;
+    camera.position.z += (CAM_DEFAULT_POS.z - camera.position.z) * 0.05;
+    camera.lookAt(CAM_DEFAULT_LOOK);
+  }
+}
 // ================================================================
 
 function showScreen(id) {
@@ -1204,6 +1481,12 @@ function animate(timestamp) {
 
   // Track score while character is flying
   tickScore();
+
+  // Sync crumbling building floor meshes
+  tickBuildings();
+
+  // Smooth camera follow / return
+  tickCamera();
 
   renderer.render(scene, camera);
 }
@@ -1279,6 +1562,9 @@ async function handleImageUpload(file) {
     // 5. Build the new standing character
     character = createCharacter(faceTexture);
 
+    // 5b. (Re-)create destructible buildings
+    initBuildings();
+
     // 6. Reset HUD and enter the game
     setDistanceDisplay(0);
     showScreen('game');
@@ -1327,11 +1613,12 @@ function setupEvents() {
     if (file) await handleImageUpload(file);
   });
 
-  // Restart button — keep current face, reset ragdoll pose
+  // Restart button — keep current face, reset ragdoll pose and rebuild buildings
   document.getElementById('restart-btn').addEventListener('click', () => {
     if (!character) return;
     if (gameState !== STATE.READY && gameState !== STATE.FLYING && gameState !== STATE.RETURNING) return;
     resetCharacterPose(character);
+    initBuildings();
     setDistanceDisplay(0);
     maxFlyDist = 0;
     gameState  = STATE.READY;
@@ -1344,6 +1631,7 @@ function setupEvents() {
       destroyCharacter(character);
       character = null;
     }
+    destroyBuildings();
     faceTexture = null;
     clearUploadError();
     gameState   = STATE.INTRO;
